@@ -1,1 +1,8 @@
+.env
+venv/
 storage/crypto.db
+*.db
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
