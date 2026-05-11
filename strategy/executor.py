@@ -5,11 +5,17 @@ Handles:
   - Connecting to Binance Testnet
   - Tracking open positions (in / out)
   - Placing BUY / SELL market orders
-  - Logging every trade to DuckDB
+  - Logging every trade to TimescaleDB (PostgreSQL)
+
+Why TimescaleDB instead of DuckDB for trade logging?
+  DuckDB allows only one writer at a time (file lock).
+  TimescaleDB is a server-based database — handles multiple
+  concurrent connections safely. The consumer already holds
+  the DuckDB write lock, so trade logging goes to TimescaleDB.
 """
 
 import os
-import duckdb
+import psycopg2
 from datetime import datetime, timezone
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
@@ -22,7 +28,13 @@ API_KEY    = os.getenv("BINANCE_TESTNET_API_KEY")
 API_SECRET = os.getenv("BINANCE_TESTNET_SECRET")
 SYMBOL     = os.getenv("TRADE_SYMBOL", "BTCUSDT")
 QUANTITY   = float(os.getenv("TRADE_QUANTITY", "0.001"))
-DB_PATH    = "storage/crypto.db"
+
+
+def get_timescale_connection():
+    return psycopg2.connect(
+        host="localhost", port=5432,
+        dbname="cryptodb", user="gleezon", password="crypto123"
+    )
 
 
 class Executor:
@@ -32,29 +44,29 @@ class Executor:
         self.in_position = False   # Are we currently holding BTC?
         self.entry_price = None    # Price we bought at
 
-        # Set up trade log table in DuckDB
-        self.duck = duckdb.connect(DB_PATH)
-        self.duck.execute("""
+        # Connect to TimescaleDB for trade logging
+        self.ts = get_timescale_connection()
+        self.ts.autocommit = True
+        self.cur = self.ts.cursor()
+
+        # Create trade log table if it doesn't exist
+        self.cur.execute("""
             CREATE TABLE IF NOT EXISTS trade_log (
-                id          INTEGER PRIMARY KEY,
-                time        TIMESTAMP,
-                symbol      VARCHAR,
-                side        VARCHAR,
-                quantity    DOUBLE,
-                price       DOUBLE,
-                rsi         DOUBLE,
-                pnl         DOUBLE,
-                order_id    VARCHAR,
-                status      VARCHAR
+                id          SERIAL PRIMARY KEY,
+                time        TIMESTAMPTZ,
+                symbol      TEXT,
+                side        TEXT,
+                quantity    DOUBLE PRECISION,
+                price       DOUBLE PRECISION,
+                rsi         DOUBLE PRECISION,
+                pnl         DOUBLE PRECISION,
+                order_id    TEXT,
+                status      TEXT
             )
         """)
-        self._next_id = self._get_next_id()
         print("✓ Executor connected to Binance Testnet")
+        print("✓ Trade logging → TimescaleDB")
         print(f"✓ Trading {SYMBOL} | Quantity per trade: {QUANTITY} BTC\n")
-
-    def _get_next_id(self):
-        result = self.duck.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM trade_log").fetchone()
-        return result[0]
 
     def get_balance(self):
         """Return current USDT and BTC balances on testnet."""
@@ -137,15 +149,12 @@ class Executor:
             print(f"  [ERROR] SELL failed: {e}")
 
     def _log_trade(self, side, quantity, price, rsi, pnl, order_id, status):
-        """Write trade record to DuckDB trade_log table."""
+        """Write trade record to TimescaleDB trade_log table."""
         now = datetime.now(timezone.utc)
-        self.duck.execute("""
-            INSERT INTO trade_log VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, [
-            self._next_id, now, SYMBOL, side,
-            quantity, price, rsi, pnl, order_id, status
-        ])
-        self._next_id += 1
+        self.cur.execute("""
+            INSERT INTO trade_log (time, symbol, side, quantity, price, rsi, pnl, order_id, status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, [now, SYMBOL, side, quantity, price, rsi, pnl, order_id, status])
 
     def status(self):
         """Print current position status and balances."""

@@ -11,21 +11,45 @@ Usage:
     python3 strategy/trade_engine.py
 """
 
-import duckdb
+import psycopg2
+import pandas as pd
 import time
 from datetime import datetime
 
-from rsi_engine import build_candles, calc_rsi, signal, RSI_PERIOD, CANDLE_MIN, OVERSOLD, OVERBOUGHT
+from rsi_engine import calc_rsi, signal, RSI_PERIOD, CANDLE_MIN, OVERSOLD, OVERBOUGHT
 from executor import Executor
 
 # How often to check for new signals (seconds)
 POLL_SEC = 10
 
-DB_PATH = "storage/crypto.db"
+
+def get_timescale_connection():
+    return psycopg2.connect(
+        host="localhost", port=5432,
+        dbname="cryptodb", user="gleezon", password="crypto123"
+    )
+
+
+def build_candles_from_timescale(con, candle_minutes=1):
+    """Build OHLCV candles from TimescaleDB instead of DuckDB.
+    TimescaleDB supports multiple concurrent readers unlike DuckDB."""
+    query = f"""
+        SELECT
+            time_bucket('{candle_minutes} minutes', time) AS candle_time,
+            FIRST(price, time)  AS open,
+            MAX(price)          AS high,
+            MIN(price)          AS low,
+            LAST(price, time)   AS close,
+            SUM(quantity)       AS volume
+        FROM btc_ticks
+        GROUP BY candle_time
+        ORDER BY candle_time ASC
+    """
+    return pd.read_sql(query, con)
 
 
 def run():
-    con      = duckdb.connect(DB_PATH, read_only=True)
+    con      = get_timescale_connection()
     executor = Executor()
 
     print("=" * 60)
@@ -39,7 +63,7 @@ def run():
 
     while True:
         try:
-            candles = build_candles(con, CANDLE_MIN)
+            candles = build_candles_from_timescale(con, CANDLE_MIN)
 
             if len(candles) < 2:
                 print(
