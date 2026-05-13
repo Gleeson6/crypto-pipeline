@@ -31,5 +31,19 @@ services:
     volumes:
       - timescale_data:/var/lib/postgresql/data
 
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    depends_on:
+      - timescaledb
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: crypto123
+    volumes:
+      - grafana_data:/var/lib/grafana
+
 volumes:
   timescale_data:
+  grafana_data:

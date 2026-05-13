@@ -21,8 +21,10 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from dotenv import load_dotenv
 
-# Load API keys from .env
-load_dotenv()
+# Load .env from project root (one level up from strategy/)
+# This works regardless of which directory the script is launched from
+_env_path = os.path.join(os.path.dirname(__file__), '..', '.env')
+load_dotenv(_env_path)
 
 API_KEY    = os.getenv("BINANCE_TESTNET_API_KEY")
 API_SECRET = os.getenv("BINANCE_TESTNET_SECRET")
