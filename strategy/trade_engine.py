@@ -4,8 +4,16 @@ trade_engine.py — Full Trading Loop
 Combines:
   - RSI signal calculation (from rsi_engine.py)
   - Live order execution (from executor.py)
+  - Phase 6: Risk management (stop-loss, take-profit, daily limits)
 
-Run this instead of rsi_engine.py when you want real (testnet) trades.
+Loop order every POLL_SEC seconds:
+  1. monitor_position() — risk checks FIRST, always
+  2. Build candles from TimescaleDB
+  3. Calculate RSI
+  4. Execute buy/sell based on signal
+
+Risk management always runs before strategy — if stop-loss or
+take-profit fires, the position is closed before RSI even gets checked.
 
 Usage:
     python3 strategy/trade_engine.py
@@ -63,6 +71,11 @@ def run():
 
     while True:
         try:
+            # --- Step 1: Risk management runs FIRST every loop ---
+            # Stop-loss and take-profit checks happen before RSI is even calculated.
+            # If the position needs to be closed for risk reasons, it happens here.
+            executor.monitor_position()
+
             candles = build_candles_from_timescale(con, CANDLE_MIN)
 
             if len(candles) < 2:
@@ -91,7 +104,7 @@ def run():
                 executor.buy(rsi_value=rsi)
 
             elif action.strip() == "SELL":
-                executor.sell(rsi_value=rsi)
+                executor.sell(rsi_value=rsi, reason="RSI_SIGNAL")
 
         except Exception as e:
             print(f"[ERROR] {e}")
