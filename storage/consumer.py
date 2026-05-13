@@ -1,13 +1,25 @@
 """
 consumer.py — Kafka Consumer (dual-write: DuckDB + TimescaleDB)
 ---------------------------------------------------------------
+Phase 8: Multi-coin support — unified ticks table for all coins
+
 Reads every tick from the Kafka topic `crypto_ticks` and writes it to:
   - DuckDB       (storage/crypto.db)   — for RSI / backtesting queries
   - TimescaleDB  (PostgreSQL)           — for live concurrent access
 
-Auto-reconnect: if TimescaleDB goes down and comes back up (e.g. docker
-restart), this consumer detects the broken connection and reconnects
-automatically instead of failing silently.
+Phase 8 change: btc_ticks table → ticks table
+  Previously we had a table called btc_ticks hardcoded for Bitcoin.
+  Now all coins (BTC, ETH, SOL, BNB) write into a single 'ticks' table.
+  The 'symbol' column tells you which coin each row belongs to.
+
+  Why one table instead of one table per coin?
+  - Simpler schema — one place to query all market data
+  - RSI engine filters by symbol: WHERE symbol = 'ETHUSDT'
+  - Grafana can show all coins on one dashboard with a symbol filter
+  - Adding a new coin requires zero schema changes
+
+Auto-reconnect: if TimescaleDB goes down and comes back up,
+this consumer detects the broken connection and reconnects automatically.
 
 Usage:
     python3 storage/consumer.py
@@ -27,11 +39,11 @@ TS_CONFIG = dict(
 )
 
 # ---------------------------------------------------------------------------
-# DuckDB — write lock held for lifetime of this process (intentional)
+# DuckDB — unified ticks table for all coins
 # ---------------------------------------------------------------------------
 duck = duckdb.connect('storage/crypto.db')
 duck.execute("""
-    CREATE TABLE IF NOT EXISTS btc_ticks (
+    CREATE TABLE IF NOT EXISTS ticks (
         symbol      VARCHAR,
         price       DOUBLE,
         quantity    DOUBLE,
@@ -39,7 +51,7 @@ duck.execute("""
         received_at TIMESTAMP
     )
 """)
-print("✓ DuckDB connected → storage/crypto.db")
+print("✓ DuckDB connected → storage/crypto.db (ticks table)")
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +64,28 @@ def connect_timescale():
             con = psycopg2.connect(**TS_CONFIG)
             con.autocommit = True
             cur = con.cursor()
-            print("✓ TimescaleDB connected → cryptodb@localhost:5432")
+
+            # Create unified ticks table if it doesn't exist
+            # TimescaleDB hypertable partitioned by time — handles millions
+            # of rows across all coins efficiently
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS ticks (
+                    time        TIMESTAMPTZ      NOT NULL,
+                    symbol      TEXT             NOT NULL,
+                    price       DOUBLE PRECISION NOT NULL,
+                    quantity    DOUBLE PRECISION NOT NULL,
+                    trade_time  BIGINT
+                )
+            """)
+            cur.execute("""
+                SELECT create_hypertable('ticks', 'time', if_not_exists => TRUE)
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_ticks_symbol
+                ON ticks (symbol, time DESC)
+            """)
+
+            print("✓ TimescaleDB connected → cryptodb@localhost:5432 (ticks table)")
             return con, cur
         except psycopg2.OperationalError as e:
             print(f"[WARN] TimescaleDB unavailable: {e}")
@@ -83,7 +116,8 @@ consumer = KafkaConsumer(
 )
 
 print("✓ Kafka consumer connected → topic: crypto_ticks")
-print("\nDual-writing ticks: DuckDB ✓  TimescaleDB ✓\n")
+print("\nDual-writing ticks: DuckDB ✓  TimescaleDB ✓")
+print("Coins: BTC, ETH, SOL, BNB\n")
 
 tick_count = 0
 
@@ -95,7 +129,7 @@ for message in consumer:
     duck_ok = False
     try:
         duck.execute("""
-            INSERT INTO btc_ticks VALUES (?, ?, ?, ?, ?)
+            INSERT INTO ticks VALUES (?, ?, ?, ?, ?)
         """, [tick['symbol'], tick['price'], tick['quantity'], tick['timestamp'], now])
         duck_ok = True
     except Exception as e:
@@ -109,7 +143,7 @@ for message in consumer:
                 raise psycopg2.OperationalError("Connection lost")
 
             ts_cur.execute("""
-                INSERT INTO btc_ticks (time, symbol, price, quantity, trade_time)
+                INSERT INTO ticks (time, symbol, price, quantity, trade_time)
                 VALUES (%s, %s, %s, %s, %s)
             """, [now, tick['symbol'], tick['price'], tick['quantity'], tick['timestamp']])
             ts_ok = True

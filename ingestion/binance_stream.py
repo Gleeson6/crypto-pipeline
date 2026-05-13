@@ -1,13 +1,25 @@
 """
-binance_stream.py — Binance WebSocket → Kafka
-----------------------------------------------
-Connects to Binance's live trade stream for BTC/USDT.
-Publishes every tick to the Kafka topic: crypto_ticks
+binance_stream.py — Binance Multi-Coin WebSocket → Kafka
+---------------------------------------------------------
+Phase 8: Multi-coin support — BTC, ETH, SOL, BNB
 
-Auto-reconnect: if the WebSocket drops (network blip, timeout,
-Binance server-side close), it waits RECONNECT_DELAY seconds
-and tries again — forever. This is the production pattern for
-any always-on data ingestion process.
+Connects to Binance's combined stream endpoint which lets us subscribe
+to multiple coin streams over a SINGLE WebSocket connection.
+
+Why one connection instead of four?
+  - Fewer network connections = less overhead
+  - Binance rate limits connections — one combined stream is cleaner
+  - Simpler reconnect logic — one handler manages everything
+
+URL format for combined streams:
+  wss://stream.binance.com:9443/stream?streams=btcusdt@trade/ethusdt@trade/...
+
+Message format (different from single stream):
+  Single stream: {"p": price, "q": qty, "T": timestamp}
+  Combined stream: {"stream": "btcusdt@trade", "data": {"p": price, ...}}
+
+All ticks published to the same Kafka topic: crypto_ticks
+Symbol field differentiates which coin each tick belongs to.
 
 Usage:
     python3 ingestion/binance_stream.py
@@ -21,12 +33,20 @@ from kafka import KafkaProducer
 from kafka.errors import NoBrokersAvailable
 
 RECONNECT_DELAY = 5
-WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@trade"
-KAFKA_TOPIC = "crypto_ticks"
+KAFKA_TOPIC     = "crypto_ticks"
+
+# --- Phase 8: All coins we're trading ---
+# To add a new coin, just add it to this list — nothing else needs changing.
+# Format must match Binance's stream name: lowercase symbol + @trade
+COINS = ["btcusdt", "ethusdt", "solusdt", "bnbusdt"]
+
+# Build the combined stream URL from the coins list
+STREAMS = "/".join([f"{coin}@trade" for coin in COINS])
+WS_URL  = f"wss://stream.binance.com:9443/stream?streams={STREAMS}"
 
 
 def get_producer():
-    """Create a Kafka producer, retrying until Kafka is available."""
+    """Create Kafka producer, retrying until Kafka is available."""
     while True:
         try:
             producer = KafkaProducer(
@@ -44,15 +64,32 @@ producer = get_producer()
 
 
 def on_message(ws, message):
-    data = json.loads(message)
+    """
+    Handle incoming messages from the combined stream.
+
+    Combined stream wraps each tick in a 'stream' + 'data' envelope.
+    We extract the symbol from 'stream' field and the tick from 'data'.
+    Then publish a normalised tick to Kafka with the symbol included.
+    """
+    msg = json.loads(message)
+
+    # Extract which coin this tick is for
+    # "btcusdt@trade" → split on "@" → "btcusdt" → uppercase → "BTCUSDT"
+    stream_name = msg.get('stream', '')
+    symbol      = stream_name.split('@')[0].upper()
+
+    # The actual tick data is nested inside 'data'
+    data = msg.get('data', {})
+
     tick = {
-        'symbol':    'BTCUSDT',
+        'symbol':    symbol,
         'price':     float(data['p']),
         'quantity':  float(data['q']),
         'timestamp': data['T']
     }
+
     producer.send(KAFKA_TOPIC, tick)
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Published → BTC/USDT: ${tick['price']:,.2f}")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {symbol}: ${float(data['p']):,.2f}")
 
 
 def on_error(ws, error):
@@ -60,20 +97,22 @@ def on_error(ws, error):
 
 
 def on_close(ws, close_status_code, close_msg):
-    print(f"[WARN] Connection closed (code={close_status_code}) — reconnecting in {RECONNECT_DELAY}s...")
+    print(f"[WARN] Connection closed — reconnecting in {RECONNECT_DELAY}s...")
 
 
 def on_open(ws):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] ✓ Connected to Binance WebSocket")
-    print(f"  → Publishing live BTC/USDT ticks to Kafka topic: {KAFKA_TOPIC}\n")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] ✓ Connected to Binance combined stream")
+    print(f"  → Streaming: {', '.join([c.upper() for c in COINS])}")
+    print(f"  → Publishing to Kafka topic: {KAFKA_TOPIC}\n")
 
 
 def run():
-    print("=" * 55)
-    print("  Binance WebSocket Ingestion — BTC/USDT")
-    print(f"  Kafka topic : {KAFKA_TOPIC}")
-    print(f"  Reconnect  : auto, {RECONNECT_DELAY}s delay on drop")
-    print("=" * 55)
+    print("=" * 60)
+    print("  Binance Multi-Coin WebSocket Ingestion")
+    print(f"  Coins    : {', '.join([c.upper() for c in COINS])}")
+    print(f"  Topic    : {KAFKA_TOPIC}")
+    print(f"  Reconnect: auto, {RECONNECT_DELAY}s delay on drop")
+    print("=" * 60)
 
     while True:
         ws = websocket.WebSocketApp(
@@ -83,10 +122,8 @@ def run():
             on_close=on_close,
             on_open=on_open
         )
-        # ping_interval keeps connection alive (Binance drops idle after 24h)
         ws.run_forever(ping_interval=30, ping_timeout=10)
-
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Reconnecting in {RECONNECT_DELAY}s...")
+        print(f"Reconnecting in {RECONNECT_DELAY}s...")
         time.sleep(RECONNECT_DELAY)
 
 
