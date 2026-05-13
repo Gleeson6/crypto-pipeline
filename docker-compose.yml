@@ -44,6 +44,77 @@ services:
     volumes:
       - grafana_data:/var/lib/grafana
 
+  # --- Airflow: dedicated PostgreSQL for Airflow's internal metadata ---
+  airflow_db:
+    image: postgres:15
+    container_name: airflow_db
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow123
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 5
+
+  # --- Airflow Init ---
+  # Runs once on startup to initialise the Airflow database schema and
+  # create the admin user. Once done it exits — it's not a long-running service.
+  # The webserver and scheduler wait for this to complete before starting.
+  airflow_init:
+    image: apache/airflow:2.9.1
+    container_name: airflow_init
+    depends_on:
+      airflow_db:
+        condition: service_healthy
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow123@airflow_db/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__WEBSERVER__SECRET_KEY: crypto_pipeline_secret
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: crypto123
+    command: >
+      bash -c "airflow db migrate && airflow users create --username admin --password crypto123 --firstname Gleezon --lastname Admin --role Admin --email gleesonminoy7@gmail.com || true"
+
+  # --- Airflow Webserver ---
+  airflow_webserver:
+    image: apache/airflow:2.9.1
+    container_name: airflow_webserver
+    depends_on:
+      airflow_init:
+        condition: service_completed_successfully
+    ports:
+      - "8080:8080"
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow123@airflow_db/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__WEBSERVER__SECRET_KEY: crypto_pipeline_secret
+    volumes:
+      - ./dags:/opt/airflow/dags
+    command: webserver
+
+  # --- Airflow Scheduler ---
+  airflow_scheduler:
+    image: apache/airflow:2.9.1
+    container_name: airflow_scheduler
+    depends_on:
+      airflow_init:
+        condition: service_completed_successfully
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow123@airflow_db/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__WEBSERVER__SECRET_KEY: crypto_pipeline_secret
+    volumes:
+      - ./dags:/opt/airflow/dags
+    command: scheduler
+
 volumes:
   timescale_data:
   grafana_data:
+  airflow_db_data:
