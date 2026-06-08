@@ -1,0 +1,26 @@
+{
+  "arxiv_id": "2601.17008v1",
+  "title": "Bayesian Robust Financial Trading with Adversarial Synthetic Market Data",
+  "authors": [
+    "Haochong Xia",
+    "Simin Li",
+    "Ruixiao Xu",
+    "Zhixia Zhang",
+    "Hongxiang Wang",
+    "Zhiqian Liu",
+    "Teng Yao Long",
+    "Molei Qin",
+    "Chuqiao Zong",
+    "Bo An"
+  ],
+  "categories": [
+    "cs.LG",
+    "q-fin.TR"
+  ],
+  "published": "2026-01-14T13:15:46Z",
+  "summary": "Algorithmic trading relies on machine learning models to make trading decisions. Despite strong in-sample performance, these models often degrade when confronted with evolving real-world market regimes, which can shift dramatically due to macroeconomic changes-e.g., monetary policy updates or unanticipated fluctuations in participant behavior. We identify two challenges that perpetuate this mismatch: (1) insufficient robustness in existing policy against uncertainties in high-level market fluctuations, and (2) the absence of a realistic and diverse simulation environment for training, leading to policy overfitting. To address these issues, we propose a Bayesian Robust Framework that systematically integrates a macro-conditioned generative model with robust policy learning. On the data side, to generate realistic and diverse data, we propose a macro-conditioned GAN-based generator that leverages macroeconomic indicators as primary control variables, synthesizing data with faithful temporal, cross-instrument, and macro correlations. On the policy side, to learn robust policy against market fluctuations, we cast the trading process as a two-player zero-sum Bayesian Markov game, wherein an adversarial agent simulates shifting regimes by perturbing macroeconomic indicators in the macro-conditioned generator, while the trading agent-guided by a quantile belief network-maintains and updates its belief over hidden market states. The trading agent seeks a Robust Perfect Bayesian Equilibrium via Bayesian neural fictitious self-play, stabilizing learning under adversarial market perturbations. Extensive experiments on 9 financial instruments demonstrate that our framework outperforms 9 state-of-the-art baselines. In extreme events like the COVID, our method shows improved profitability and risk management, offering a reliable solution for trading under uncertain and shifting market dynamics.",
+  "pdf_url": "https://arxiv.org/pdf/2601.17008v1",
+  "source_query": "risk management algorithmic trading",
+  "pdf_path": null,
+  "text": ""
+}

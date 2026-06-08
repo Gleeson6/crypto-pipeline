@@ -15,6 +15,14 @@ Notes:
   usage guidelines (no more than 1 request / 3 seconds).
 - PDFs are saved to <out>/pdfs/, extracted text + metadata to <out>/records/
   as one JSON file per paper, and a combined manifest at <out>/manifest.jsonl
+
+PDF text extraction backends:
+- Default: pypdf (local, free, no API key — `pip install pypdf`). Fine for
+  text-heavy papers; can mangle tables/equations/multi-column layouts.
+- Optional: LlamaParse (hosted, higher quality on dense academic PDFs —
+  `pip install llama-parse`). Enable by setting the LLAMA_CLOUD_API_KEY
+  environment variable; the script automatically prefers it when present
+  and falls back to pypdf if it's unavailable or fails on a given file.
 """
 
 import argparse
@@ -30,17 +38,44 @@ ARXIV_API = "http://export.arxiv.org/api/query"
 ATOM_NS = "{http://www.w3.org/2005/Atom}"
 
 # Curated keyword sets — tune these to your project's focus areas.
+# Grouped by knowledge domain so you can run subsets independently
+# (e.g. --queries "value at risk" "Sharpe ratio" for a risk-focused pull).
 DEFAULT_QUERIES = [
+    # Crypto / price prediction (original focus)
     "cryptocurrency price prediction",
     "bitcoin volatility forecasting",
     "market microstructure cryptocurrency",
     "deep learning financial time series",
     "on-chain analysis blockchain",
     "algorithmic trading reinforcement learning",
+    # Quantitative trading
+    "quantitative trading strategies",
+    "statistical arbitrage",
+    "momentum and mean reversion strategies",
+    "market making algorithms",
+    "backtesting trading strategies overfitting",
+    # Statistics & probability in finance
+    "stochastic processes financial markets",
+    "volatility clustering fat tails",
+    "time series stationarity financial returns",
+    "Bayesian methods quantitative finance",
+    # ML in quant trading / finance
+    "machine learning stock prediction",
+    "neural networks financial forecasting",
+    "feature engineering financial machine learning",
+    "transformer models time series forecasting",
+    "reinforcement learning portfolio management",
+    # Risk management
+    "value at risk portfolio management",
+    "risk management algorithmic trading",
+    "drawdown control position sizing",
+    "tail risk extreme events finance",
+    "Sharpe ratio risk-adjusted performance",
 ]
 
-# Restrict to relevant arXiv categories (quant finance + ML).
-CATEGORIES = ["q-fin.ST", "q-fin.TR", "q-fin.CP", "cs.LG", "cs.AI", "stat.ML"]
+# Restrict to relevant arXiv categories (quant finance + ML + stats).
+CATEGORIES = ["q-fin.ST", "q-fin.TR", "q-fin.CP", "q-fin.RM", "q-fin.PM",
+              "cs.LG", "cs.AI", "stat.ML", "stat.AP"]
 
 
 def build_query(keyword: str) -> str:
@@ -114,8 +149,29 @@ def download_pdf(url: str, dest_path: str) -> bool:
         return False
 
 
-def extract_text(pdf_path: str) -> str:
-    """Extract text from a PDF using pypdf (falls back gracefully if missing)."""
+def extract_text_llamaparse(pdf_path: str, api_key: str) -> str:
+    """
+    Extract text via LlamaParse (LlamaIndex's hosted PDF parsing API).
+    Produces much cleaner output than pypdf on dense academic PDFs —
+    tables, multi-column layouts, equations — at the cost of an API call.
+    Returns "" on any failure so the caller can fall back to pypdf.
+    """
+    try:
+        from llama_parse import LlamaParse
+    except ImportError:
+        print("  ! llama-parse not installed (pip install llama-parse). Falling back to pypdf.")
+        return ""
+    try:
+        parser = LlamaParse(api_key=api_key, result_type="markdown")
+        documents = parser.load_data(pdf_path)
+        return "\n\n".join(d.text for d in documents if getattr(d, "text", "")).strip()
+    except Exception as e:
+        print(f"  ! LlamaParse extraction failed ({e}); falling back to pypdf.")
+        return ""
+
+
+def extract_text_pypdf(pdf_path: str) -> str:
+    """Extract text from a PDF using pypdf (basic, free, fully local)."""
     try:
         from pypdf import PdfReader
     except ImportError:
@@ -131,8 +187,28 @@ def extract_text(pdf_path: str) -> str:
             text_parts.append(page.extract_text() or "")
         return "\n".join(text_parts).strip()
     except Exception as e:
-        print(f"  ! Text extraction failed: {e}")
+        print(f"  ! pypdf extraction failed: {e}")
         return ""
+
+
+def extract_text(pdf_path: str) -> str:
+    """
+    Extract text from a PDF, preferring LlamaParse when configured.
+
+    Set the LLAMA_CLOUD_API_KEY environment variable to enable LlamaParse
+    (higher-quality parsing of tables/equations/layout — better for dense
+    research papers, but a hosted API with usage limits/costs).
+
+    Without that variable set, falls back to pypdf — fully local and free,
+    fine for text-heavy papers, weaker on complex layouts.
+    """
+    api_key = os.environ.get("LLAMA_CLOUD_API_KEY")
+    if api_key:
+        text = extract_text_llamaparse(pdf_path, api_key)
+        if text:
+            return text
+        # fall through to pypdf if LlamaParse returned nothing
+    return extract_text_pypdf(pdf_path)
 
 
 def main():

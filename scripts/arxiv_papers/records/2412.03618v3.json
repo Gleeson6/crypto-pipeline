@@ -1,0 +1,17 @@
+{
+  "arxiv_id": "2412.03618v3",
+  "title": "Research on Financial Multi-Asset Portfolio Risk Prediction Model Based on Convolutional Neural Networks and Image Processing",
+  "authors": [
+    "Fu Lei",
+    "Ge Shi"
+  ],
+  "categories": [
+    "q-fin.RM"
+  ],
+  "published": "2024-12-04T14:53:02Z",
+  "summary": "In today's complex and volatile financial market environment, risk management of multi-asset portfolios faces significant challenges. Traditional risk assessment methods, due to their limited ability to capture complex correlations between assets, find it difficult to effectively cope with dynamic market changes. This paper proposes a multi-asset portfolio risk prediction model based on Convolutional Neural Networks (CNN). By utilizing image processing techniques, financial time series data are converted into two-dimensional images to extract high-order features and enhance the accuracy of risk prediction. Through empirical analysis of data from multiple asset classes such as stocks, bonds, commodities, and foreign exchange, the results show that the proposed CNN model significantly outperforms traditional models in terms of prediction accuracy and robustness, especially under extreme market conditions. This research provides a new method for financial risk management, with important theoretical significance and practical value.",
+  "pdf_url": "https://arxiv.org/pdf/2412.03618v3",
+  "source_query": "value at risk portfolio management",
+  "pdf_path": null,
+  "text": ""
+}

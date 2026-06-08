@@ -23,8 +23,8 @@ import json
 import os
 import re
 
-CHUNK_SIZE = 1000       # characters per chunk
-CHUNK_OVERLAP = 150     # overlap between consecutive chunks
+CHUNK_SIZE = 1000       # target characters per chunk (soft cap — see chunk_text)
+CHUNK_OVERLAP = 150     # characters carried forward into the next chunk for context
 
 # Trust tiers — used downstream to weight or filter retrieval results.
 # Higher tier = more empirically grounded / rigorous.
@@ -36,21 +36,102 @@ TRUST_TIERS = {
 }
 
 
+# Separator ladder for recursive splitting, most-meaningful first.
+# We try to keep whole paragraphs/sentences together and only fall back
+# to a harder split when a piece is still too large for one chunk.
+_SPLIT_SEPARATORS = ["\n\n", "\n", ". ", " "]
+
+
+def _split_on_separator(text: str, separators):
+    """
+    Recursively split `text` using the first separator in `separators`
+    that actually breaks it into more than one piece, falling through to
+    the next separator (and finally to a raw character cut) if needed.
+    Returns a list of pieces, each as small as the chosen separator allows.
+    """
+    if not separators:
+        # Last resort: no separator left — return as a single piece.
+        # The caller's size-based packer will hard-cut it if necessary.
+        return [text]
+
+    sep, rest = separators[0], separators[1:]
+    if sep == " ":
+        parts = text.split(" ")
+        # Re-attach the separator so re-joining preserves spacing.
+        pieces = [p + " " for p in parts[:-1]] + [parts[-1]]
+    else:
+        parts = text.split(sep)
+        pieces = [p + sep for p in parts[:-1]] + [parts[-1]]
+
+    pieces = [p for p in pieces if p.strip()]
+    if len(pieces) <= 1:
+        # This separator didn't help — try the next one down the ladder.
+        return _split_on_separator(text, rest)
+    return pieces
+
+
+def _hard_cut(piece: str, size: int):
+    """Absolute last resort: fixed-size character slices of an oversized piece."""
+    return [piece[i:i + size] for i in range(0, len(piece), size)]
+
+
 def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP):
-    """Simple sliding-window chunker on whitespace-normalized text."""
-    text = re.sub(r"\s+", " ", text).strip()
+    """
+    Recursive / structure-aware chunker.
+
+    Rather than blindly slicing every `size` characters, this tries to keep
+    natural units of text (paragraphs, then lines, then sentences, then
+    words) intact, and packs them together up to `size` characters. Only an
+    unusually long unit gets force-cut, and even then at the lowest-priority
+    boundary available. Adjacent chunks overlap by `overlap` characters so
+    context isn't lost across a boundary.
+    """
+    text = re.sub(r"[ \t]+", " ", text).strip()
     if not text:
         return []
+
+    # Recursively break the text into small, semantically-coherent pieces.
+    def expand(piece, seps):
+        if len(piece) <= size:
+            return [piece]
+        sub_pieces = _split_on_separator(piece, seps)
+        if len(sub_pieces) == 1:
+            # Nothing left to split on — hard-cut as a last resort.
+            return _hard_cut(piece, size)
+        out = []
+        for sp in sub_pieces:
+            if sp == piece:
+                out.extend(_hard_cut(sp, size))
+            else:
+                out.extend(expand(sp, seps))
+        return out
+
+    units = expand(text, _SPLIT_SEPARATORS)
+    units = [u for u in units if u.strip()]
+    if not units:
+        return []
+
+    # Pack consecutive small units together up to `size`, carrying a
+    # character-based overlap from the tail of one chunk into the next
+    # so retrieval doesn't lose context right at a boundary.
     chunks = []
-    start = 0
-    while start < len(text):
-        end = start + size
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-        if end >= len(text):
-            break
-        start = end - overlap
+    current = ""
+    for unit in units:
+        candidate = current + unit
+        if len(candidate) <= size or not current:
+            current = candidate
+        else:
+            chunk = current.strip()
+            if chunk:
+                chunks.append(chunk)
+            # Carry the tail of the finished chunk forward as overlap.
+            tail = current[-overlap:] if overlap > 0 else ""
+            current = tail + unit
+
+    final = current.strip()
+    if final:
+        chunks.append(final)
+
     return chunks
 
 

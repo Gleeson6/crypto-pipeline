@@ -1,5 +1,6 @@
 .env
 venv/
+quant_venv/
 storage/crypto.db
 *.db
 __pycache__/
@@ -7,14 +8,4 @@ __pycache__/
 *.pyo
 .DS_Store
 rag_db/
-arxiv_papers/pdfs/
-*.pyc
-__pycache__/
-.env
-quant_venv/
-rag_db/
-arxiv_papers/pdfs/
-*.pyc
-__pycache__/
-.env
-quant_venv/
+**/arxiv_papers/pdfs/
