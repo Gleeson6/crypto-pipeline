@@ -12,3 +12,9 @@ arxiv_papers/pdfs/
 __pycache__/
 .env
 quant_venv/
+rag_db/
+arxiv_papers/pdfs/
+*.pyc
+__pycache__/
+.env
+quant_venv/
