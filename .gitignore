@@ -6,3 +6,9 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+rag_db/
+arxiv_papers/pdfs/
+*.pyc
+__pycache__/
+.env
+quant_venv/
