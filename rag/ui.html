@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Quant RAG</title>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <style>
+    :root {
+      --bg:           #0d1117;
+      --surface:      #161b22;
+      --surface2:     #1c2128;
+      --border:       #30363d;
+      --text:         #e6edf3;
+      --text-muted:   #8b949e;
+      --accent:       #58a6ff;
+      --accent-hover: #79c0ff;
+      --user-bg:      #1c2a3a;
+      --user-border:  #1f3a5a;
+      --green:        #3fb950;
+      --yellow:       #d29922;
+      --red:          #f85149;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* ── Header ── */
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 10px 20px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-shrink: 0;
+    }
+    .status-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--green);
+      flex-shrink: 0;
+    }
+    .status-dot.loading { animation: pulse 1s infinite; background: var(--yellow); }
+    .status-dot.error   { background: var(--red); }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+    header h1 { font-size: 15px; font-weight: 600; }
+    .header-meta { margin-left: auto; font-size: 12px; color: var(--text-muted); }
+    .clear-btn {
+      font-size: 12px; color: var(--text-muted);
+      background: none; border: 1px solid var(--border);
+      border-radius: 5px; padding: 3px 10px; cursor: pointer;
+      margin-left: 12px;
+    }
+    .clear-btn:hover { color: var(--red); border-color: var(--red); }
+
+    /* ── Messages ── */
+    #messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 24px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+      min-height: 0;
+    }
+
+    /* ── Empty state ── */
+    #empty-state {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 14px;
+      color: var(--text-muted);
+      text-align: center;
+      padding: 40px 20px;
+    }
+    #empty-state h2 { font-size: 20px; color: var(--text); font-weight: 600; }
+    #empty-state p  { font-size: 14px; max-width: 440px; line-height: 1.6; }
+    .chips { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 4px; }
+    .chip {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 7px 15px;
+      font-size: 13px;
+      cursor: pointer;
+      color: var(--text-muted);
+      transition: border-color .15s, color .15s;
+    }
+    .chip:hover { border-color: var(--accent); color: var(--accent); }
+
+    /* ── Message bubbles ── */
+    .msg { display: flex; flex-direction: column; gap: 5px; max-width: 88%; }
+    .msg.user      { align-self: flex-end; }
+    .msg.assistant { align-self: flex-start; }
+    .msg-label {
+      font-size: 11px; color: var(--text-muted);
+      text-transform: uppercase; letter-spacing: .5px;
+    }
+    .msg.user .msg-label { text-align: right; }
+    .bubble {
+      padding: 12px 16px;
+      border-radius: 10px;
+      font-size: 14px;
+      line-height: 1.7;
+    }
+    .msg.user .bubble {
+      background: var(--user-bg);
+      border: 1px solid var(--user-border);
+    }
+    .msg.assistant .bubble {
+      background: var(--surface);
+      border: 1px solid var(--border);
+    }
+    /* Markdown inside bubbles */
+    .bubble p          { margin-bottom: 8px; }
+    .bubble p:last-child { margin-bottom: 0; }
+    .bubble h1,.bubble h2,.bubble h3 { margin: 12px 0 6px; color: var(--text); }
+    .bubble ul,.bubble ol { padding-left: 20px; margin-bottom: 8px; }
+    .bubble li         { margin-bottom: 4px; }
+    .bubble code       { background: var(--bg); padding: 2px 6px; border-radius: 4px; font-size: 12px; font-family: monospace; }
+    .bubble pre        { background: var(--bg); padding: 12px; border-radius: 6px; overflow-x: auto; margin: 8px 0; }
+    .bubble pre code   { background: none; padding: 0; }
+    .bubble strong     { color: #fff; }
+    .bubble em         { color: #a5d6ff; }
+    .bubble blockquote { border-left: 3px solid var(--accent); padding-left: 12px; color: var(--text-muted); margin: 8px 0; }
+
+    /* Streaming cursor */
+    .cursor {
+      display: inline-block; width: 8px; height: 15px;
+      background: var(--accent); margin-left: 2px;
+      animation: blink .75s infinite; vertical-align: text-bottom;
+      border-radius: 1px;
+    }
+    @keyframes blink { 0%,49%{opacity:1} 50%,100%{opacity:0} }
+
+    /* ── Sources ── */
+    .sources-toggle {
+      font-size: 12px; color: var(--text-muted);
+      cursor: pointer; display: flex; align-items: center; gap: 5px;
+      padding: 4px 0; user-select: none; width: fit-content;
+    }
+    .sources-toggle:hover { color: var(--accent); }
+    .chevron { transition: transform .2s; display: inline-block; }
+    .sources-toggle.open .chevron { transform: rotate(90deg); }
+    .sources-grid { display: none; flex-direction: column; gap: 7px; margin-top: 5px; }
+    .sources-grid.open { display: flex; }
+    .src-card {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      padding: 9px 12px;
+      font-size: 12px;
+    }
+    .src-head { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; margin-bottom: 5px; }
+    .src-title { font-weight: 600; color: var(--text); }
+    .badge {
+      padding: 2px 8px; border-radius: 10px;
+      font-size: 10px; font-weight: 700; text-transform: uppercase; white-space: nowrap;
+    }
+    .b-arxiv   { background:#1c2a3a; color:#58a6ff; }
+    .b-onchain { background:#1a2e1a; color:#3fb950; }
+    .b-notes   { background:#2a2010; color:#d29922; }
+    .b-blog    { background:#2e1a1a; color:#f85149; }
+    .b-t3 { background:#1a2e1a; color:#3fb950; }
+    .b-t2 { background:#2a2010; color:#d29922; }
+    .b-t1 { background:#2e1a1a; color:#f85149; }
+    .src-sim { margin-left: auto; color: var(--text-muted); font-size: 11px; white-space: nowrap; }
+    .src-snippet { color: var(--text-muted); line-height: 1.5; }
+
+    /* ── Input area ── */
+    #input-area {
+      border-top: 1px solid var(--border);
+      padding: 14px 20px;
+      background: var(--surface);
+      flex-shrink: 0;
+    }
+    #input-row { display: flex; gap: 10px; align-items: flex-end; }
+    #qinput {
+      flex: 1;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 14px;
+      color: var(--text);
+      font-size: 14px;
+      font-family: inherit;
+      resize: none;
+      min-height: 42px;
+      max-height: 130px;
+      line-height: 1.5;
+      outline: none;
+      transition: border-color .15s;
+    }
+    #qinput:focus { border-color: var(--accent); }
+    #qinput::placeholder { color: var(--text-muted); }
+    #send-btn {
+      background: var(--accent); color: #0d1117;
+      border: none; border-radius: 8px;
+      padding: 0 20px; height: 42px;
+      font-size: 14px; font-weight: 700;
+      cursor: pointer; white-space: nowrap;
+      transition: background .15s;
+    }
+    #send-btn:hover    { background: var(--accent-hover); }
+    #send-btn:disabled { background: var(--border); color: var(--text-muted); cursor: not-allowed; }
+    .hint { font-size: 11px; color: var(--text-muted); margin-top: 6px; }
+
+    /* ── Scrollbar ── */
+    ::-webkit-scrollbar { width: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="status-dot loading" id="sdot"></div>
+  <h1>⚡ Quant RAG</h1>
+  <span class="header-meta" id="hmeta">Connecting...</span>
+  <button class="clear-btn" onclick="clearSession()">New chat</button>
+</header>
+
+<div id="messages">
+  <div id="empty-state">
+    <h2>Quant RAG Assistant</h2>
+    <p>Ask about Bitcoin trading signals, on-chain metrics, quantitative strategies, or risk models. Answers stream in real-time with source citations.</p>
+    <div class="chips">
+      <div class="chip" onclick="useChip(this)">What does MVRV tell us about Bitcoin cycle tops?</div>
+      <div class="chip" onclick="useChip(this)">How do funding rates signal squeeze bottoms?</div>
+      <div class="chip" onclick="useChip(this)">Explain RSI divergence as a 1-4H entry signal</div>
+      <div class="chip" onclick="useChip(this)">What does high exchange inflow signal about price?</div>
+      <div class="chip" onclick="useChip(this)">How should I size a position with 1-2% risk per trade?</div>
+    </div>
+  </div>
+</div>
+
+<div id="input-area">
+  <div id="input-row">
+    <textarea id="qinput" placeholder="Ask a quant research question..." rows="1"></textarea>
+    <button id="send-btn" onclick="send()">Send</button>
+  </div>
+  <div class="hint">Enter to send &nbsp;·&nbsp; Shift+Enter for newline</div>
+</div>
+
+<script>
+  // ── Session persistence ─────────────────────────────────────────────────────
+  const SESS_KEY = 'qrag_sid';
+  let sessionId = localStorage.getItem(SESS_KEY) || '';
+  let streaming  = false;
+
+  // ── Marked config ───────────────────────────────────────────────────────────
+  marked.setOptions({ breaks: true, gfm: true });
+
+  // ── Health ──────────────────────────────────────────────────────────────────
+  async function checkHealth() {
+    try {
+      const d = await (await fetch('/api/health')).json();
+      document.getElementById('sdot').className = 'status-dot';
+      document.getElementById('hmeta').textContent =
+        `${d.chunks.toLocaleString()} chunks · ${d.hybrid ? 'hybrid search' : 'dense-only'} · ${d.sessions} sessions`;
+    } catch {
+      document.getElementById('sdot').className = 'status-dot error';
+      document.getElementById('hmeta').textContent = 'Server offline';
+    }
+  }
+  checkHealth();
+
+  // ── Textarea auto-resize ────────────────────────────────────────────────────
+  const ta = document.getElementById('qinput');
+  ta.addEventListener('input', () => { ta.style.height='auto'; ta.style.height=Math.min(ta.scrollHeight,130)+'px'; });
+  ta.addEventListener('keydown', e => { if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); send(); } });
+
+  function useChip(el) { ta.value = el.textContent.trim(); ta.dispatchEvent(new Event('input')); ta.focus(); }
+
+  // ── Clear session ───────────────────────────────────────────────────────────
+  async function clearSession() {
+    if (sessionId) {
+      await fetch('/api/sessions/clear?session_id=' + encodeURIComponent(sessionId), { method: 'POST' });
+    }
+    sessionId = '';
+    localStorage.removeItem(SESS_KEY);
+    const msgs = document.getElementById('messages');
+    msgs.innerHTML = '';
+    const es = document.createElement('div');
+    es.id = 'empty-state';
+    es.innerHTML = `
+      <h2>Quant RAG Assistant</h2>
+      <p>Session cleared. Ask a new question to start fresh.</p>`;
+    msgs.appendChild(es);
+    checkHealth();
+  }
+
+  // ── Send ────────────────────────────────────────────────────────────────────
+  async function send() {
+    const q = ta.value.trim();
+    if (!q || streaming) return;
+    streaming = true;
+    document.getElementById('send-btn').disabled = true;
+    document.getElementById('empty-state')?.remove();
+
+    addMsg('user', q);
+    ta.value = ''; ta.style.height = 'auto';
+
+    const aMsg  = addMsg('assistant', '');
+    const bbl   = aMsg.querySelector('.bubble');
+    const cursor = Object.assign(document.createElement('span'), { className: 'cursor' });
+    bbl.appendChild(cursor);
+
+    let full = '';
+    let sources = null;
+
+    try {
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: q, session_id: sessionId }),
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+
+      const reader = res.body.getReader();
+      const dec    = new TextDecoder();
+      let buf = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop();
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          let evt;
+          try { evt = JSON.parse(line.slice(6)); } catch { continue; }
+
+          if (evt.type === 'meta') {
+            sessionId = evt.session_id;
+            localStorage.setItem(SESS_KEY, sessionId);
+            sources = evt.sources;
+
+          } else if (evt.type === 'token') {
+            full += evt.content;
+            bbl.innerHTML = marked.parse(full);
+            bbl.appendChild(cursor);
+            scrollBottom();
+
+          } else if (evt.type === 'done') {
+            bbl.innerHTML = marked.parse(full);
+            if (sources && sources.length) aMsg.appendChild(buildSources(sources));
+            scrollBottom();
+
+          } else if (evt.type === 'error') {
+            bbl.innerHTML = `<span style="color:var(--red)">⚠ ${escHtml(evt.message)}</span>`;
+          }
+        }
+      }
+    } catch (e) {
+      bbl.innerHTML = `<span style="color:var(--red)">⚠ Connection error: ${escHtml(e.message)}</span>`;
+    } finally {
+      cursor.remove();
+      streaming = false;
+      document.getElementById('send-btn').disabled = false;
+      ta.focus();
+      checkHealth();
+    }
+  }
+
+  // ── Add message ─────────────────────────────────────────────────────────────
+  function addMsg(role, text) {
+    const d = document.createElement('div');
+    d.className = 'msg ' + role;
+    d.innerHTML = `<div class="msg-label">${role === 'user' ? 'You' : 'Quant RAG'}</div>
+                   <div class="bubble">${text ? marked.parse(text) : ''}</div>`;
+    document.getElementById('messages').appendChild(d);
+    scrollBottom();
+    return d;
+  }
+
+  // ── Build sources element ───────────────────────────────────────────────────
+  function buildSources(srcs) {
+    const wrap   = document.createElement('div');
+    const toggle = document.createElement('div');
+    toggle.className = 'sources-toggle';
+    toggle.innerHTML = `<span class="chevron">▶</span> ${srcs.length} source${srcs.length>1?'s':''} retrieved`;
+
+    const grid = document.createElement('div');
+    grid.className = 'sources-grid';
+
+    srcs.forEach(s => {
+      const typeClass = { arxiv_paper:'arxiv', onchain_reference:'onchain', strategy_notes:'notes' }[s.source_type] || 'blog';
+      const tClass    = 'b-t' + (s.trust || 1);
+      const extra     = s.arxiv_id ? ` &middot; arXiv:${s.arxiv_id}` : (s.published ? ` &middot; ${s.published}` : '');
+      const card = document.createElement('div');
+      card.className = 'src-card';
+      card.innerHTML = `
+        <div class="src-head">
+          <span class="src-title">${escHtml(s.title)}</span>
+          <span class="badge b-${typeClass}">${s.source_type.replace(/_/g,' ')}</span>
+          <span class="badge ${tClass}">trust ${s.trust}</span>
+          <span class="src-sim">sim ${s.sim}${extra}</span>
+        </div>
+        <div class="src-snippet">${escHtml(s.snippet)}</div>`;
+      grid.appendChild(card);
+    });
+
+    toggle.addEventListener('click', () => {
+      toggle.classList.toggle('open');
+      grid.classList.toggle('open');
+    });
+    wrap.appendChild(toggle);
+    wrap.appendChild(grid);
+    return wrap;
+  }
+
+  // ── Util ────────────────────────────────────────────────────────────────────
+  function scrollBottom() {
+    const m = document.getElementById('messages');
+    m.scrollTop = m.scrollHeight;
+  }
+  function escHtml(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+</script>
+</body>
+</html>

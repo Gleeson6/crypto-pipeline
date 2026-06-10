@@ -21,6 +21,7 @@ import argparse
 import glob
 import json
 import os
+import pickle
 import re
 
 CHUNK_SIZE = 1000       # target characters per chunk (soft cap — see chunk_text)
@@ -207,6 +208,58 @@ def get_embedder(model_name: str = "default"):
     return embedding_functions.DefaultEmbeddingFunction()
 
 
+def build_bm25_index(docs: list, ids: list, metas: list, db_path: str):
+    """
+    Build a BM25 (Okapi BM25) keyword index over the same chunks stored in
+    ChromaDB and pickle it to {db_path}/bm25_index.pkl.
+
+    This is the sparse half of hybrid search.  At query time, rag_query.py
+    loads this file, runs a BM25 keyword search alongside the dense vector
+    search, and fuses both result sets with Reciprocal Rank Fusion (RRF)
+    before re-ranking by trust tier.
+
+    Why BM25 + dense?
+      Dense embeddings excel at semantic/conceptual similarity ("how do
+      funding rates predict squeeze bottoms?") but miss exact keyword hits
+      (ticker symbols, metric names like "MVRV", author names).  BM25 covers
+      those gaps.  RRF fusion gets you the best of both without any tuning.
+
+    Install dep (once):
+        pip install rank-bm25 --break-system-packages
+    """
+    try:
+        from rank_bm25 import BM25Okapi
+    except ImportError:
+        print("\n[BM25] rank_bm25 not installed — skipping BM25 index build.")
+        print("  Run: pip install rank-bm25 --break-system-packages")
+        print("  Then re-run rag_build.py to get hybrid search.\n")
+        return
+
+    print(f"\nBuilding BM25 index over {len(docs)} chunks...")
+
+    _token_re = re.compile(r'\b\w+\b')
+
+    def tokenize(text: str):
+        return _token_re.findall(text.lower())
+
+    tokenized_corpus = [tokenize(doc) for doc in docs]
+    bm25 = BM25Okapi(tokenized_corpus)
+
+    payload = {
+        "bm25": bm25,
+        "ids": ids,        # parallel to ChromaDB chunk IDs — used for RRF join
+        "docs": docs,      # raw text (needed when BM25 surfaces chunks not in dense top-k)
+        "metas": metas,    # metadata (trust_tier, source_type, title, ...)
+    }
+
+    out_path = os.path.join(db_path, "bm25_index.pkl")
+    with open(out_path, "wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    size_mb = os.path.getsize(out_path) / 1_048_576
+    print(f"BM25 index saved -> {out_path}  ({size_mb:.1f} MB)")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build local RAG index for Quant RAG")
     parser.add_argument("--arxiv-dir", default="./arxiv_papers/records",
@@ -271,6 +324,9 @@ def main():
 
     print(f"\nDone. Collection '{args.collection}' now has {collection.count()} chunks.")
     print(f"DB path: {args.db_path}")
+
+    # Build BM25 sparse index alongside ChromaDB for hybrid search.
+    build_bm25_index(docs, ids, metadatas, args.db_path)
 
 
 if __name__ == "__main__":

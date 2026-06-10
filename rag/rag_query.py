@@ -16,9 +16,71 @@ Install deps (if not already):
 """
 
 import argparse
+import os
+import pickle
 import re
 
 from rag_build import get_collection, get_embedder  # reuse the same model/DB setup
+
+# ── Hybrid search (BM25 + dense, fused with RRF) ─────────────────────────────
+
+# Standard Reciprocal Rank Fusion constant.  Higher k = gentler rank penalty,
+# i.e. rank 1 and rank 5 are treated as more similar.  60 is the standard
+# value from the original RRF paper and works well in practice.
+RRF_K = 60
+
+
+def load_bm25_index(db_path: str):
+    """
+    Load the BM25 index built by rag_build.py.
+    Returns the payload dict (keys: bm25, ids, docs, metas) or None if
+    the index doesn't exist yet (dense-only fallback).
+    """
+    path = os.path.join(db_path, "bm25_index.pkl")
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def bm25_retrieve(query: str, bm25_data: dict, fetch_n: int):
+    """
+    Run BM25 keyword search over the pre-built corpus.
+
+    Returns a list of (chunk_id, bm25_score) pairs sorted by descending
+    score, up to fetch_n results.  Chunks with score=0 (no keyword overlap)
+    are excluded so they don't pollute the RRF merge.
+    """
+    _token_re = re.compile(r'\b\w+\b')
+    tokens = _token_re.findall(query.lower())
+    scores = bm25_data["bm25"].get_scores(tokens)
+    ids = bm25_data["ids"]
+
+    # Sort descending, take top-fetch_n, drop zero-score chunks
+    top_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:fetch_n]
+    return [(ids[i], float(scores[i])) for i in top_idx if scores[i] > 0]
+
+
+def rrf_merge(dense_ranked: list, sparse_ranked: list, k: int = RRF_K) -> dict:
+    """
+    Reciprocal Rank Fusion over two independently ranked lists of chunk IDs.
+
+    Each list is [(chunk_id, score), ...] sorted best-first.  Each item
+    contributes 1/(k + rank + 1) to the chunk's fused score.  A chunk that
+    appears in both lists gets contributions from both — the intersection
+    effect is what makes RRF consistently outperform either system alone.
+
+    Returns {chunk_id: rrf_score} — higher score = better combined rank.
+    """
+    fused: dict = {}
+    for rank, (chunk_id, _) in enumerate(dense_ranked):
+        fused[chunk_id] = fused.get(chunk_id, 0.0) + 1.0 / (k + rank + 1)
+    for rank, (chunk_id, _) in enumerate(sparse_ranked):
+        fused[chunk_id] = fused.get(chunk_id, 0.0) + 1.0 / (k + rank + 1)
+    return fused
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 # How much to over-fetch before re-ranking/deduping down to --k.
 # Casting a wider net first means dedup/trust-weighting has real choices
@@ -166,6 +228,8 @@ def main():
                         help="Disable start/end attention ordering (keep pure rank order)")
     parser.add_argument("--raw", action="store_true",
                         help="Print raw chunk text only, in final context order (for piping into another tool/LLM)")
+    parser.add_argument("--no-hybrid", action="store_true",
+                        help="Disable BM25 hybrid search — use dense-only retrieval (default: hybrid if index exists)")
     args = parser.parse_args()
 
     embedder = get_embedder(args.model)
@@ -180,18 +244,71 @@ def main():
     # Over-fetch so re-ranking/dedup has real candidates to choose from,
     # not just a re-shuffle of an already-narrow top-k.
     fetch_n = max(args.k * FETCH_MULTIPLIER, args.k)
+
+    # ── Dense retrieval (ChromaDB) ────────────────────────────────────────────
     results = collection.query(
         query_texts=[args.query],
         n_results=fetch_n,
         where=where or None,
+        include=["documents", "metadatas", "distances"],
     )
 
-    docs = results.get("documents", [[]])[0]
-    metas = results.get("metadatas", [[]])[0]
-    dists = results.get("distances", [[]])[0]
+    dense_docs  = results.get("documents", [[]])[0]
+    dense_metas = results.get("metadatas",  [[]])[0]
+    dense_dists = results.get("distances",  [[]])[0]
+    dense_ids   = results.get("ids",        [[]])[0]
+
+    if not dense_docs:
+        print("No results. Has the index been built? Run rag_build.py first.")
+        return
+
+    # ── Hybrid: BM25 + RRF fusion ─────────────────────────────────────────────
+    retrieval_mode = "dense-only"
+    docs, metas, dists = dense_docs, dense_metas, dense_dists
+
+    if not args.no_hybrid:
+        bm25_data = load_bm25_index(args.db_path)
+        if bm25_data is not None:
+            # Sparse retrieval
+            dense_ranked  = list(zip(dense_ids, [1 - d for d in dense_dists]))
+            sparse_ranked = bm25_retrieve(args.query, bm25_data, fetch_n)
+
+            # Fuse rankings
+            rrf_scores = rrf_merge(dense_ranked, sparse_ranked)
+
+            # Build unified ID → (doc, meta, dist) lookup from both result sets
+            id_to_chunk: dict = {}
+            for cid, doc, meta, dist in zip(dense_ids, dense_docs, dense_metas, dense_dists):
+                id_to_chunk[cid] = (doc, meta, dist)
+
+            # For BM25-only hits not in the dense top-k, pull from the BM25 corpus
+            bm25_id_map = {cid: i for i, cid in enumerate(bm25_data["ids"])}
+            for cid, _ in sparse_ranked:
+                if cid not in id_to_chunk:
+                    idx = bm25_id_map.get(cid)
+                    if idx is not None:
+                        id_to_chunk[cid] = (
+                            bm25_data["docs"][idx],
+                            bm25_data["metas"][idx],
+                            1.0,   # no cosine distance for BM25-only hits; set to 1 (unknown)
+                        )
+
+            # Reconstruct ordered candidate lists for the downstream re-ranker
+            top_rrf = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)[:fetch_n]
+            docs  = [id_to_chunk[cid][0] for cid, _ in top_rrf if cid in id_to_chunk]
+            metas = [id_to_chunk[cid][1] for cid, _ in top_rrf if cid in id_to_chunk]
+            dists = [id_to_chunk[cid][2] for cid, _ in top_rrf if cid in id_to_chunk]
+
+            n_sparse_only = sum(1 for cid, _ in top_rrf if cid not in set(dense_ids))
+            retrieval_mode = (
+                f"hybrid (dense={len(dense_ranked)}, sparse={len(sparse_ranked)}, "
+                f"sparse-only hits in top-{fetch_n}={n_sparse_only})"
+            )
+        else:
+            retrieval_mode = "dense-only (BM25 index not found — run rag_build.py to enable hybrid)"
 
     if not docs:
-        print("No results. Has the index been built? Run rag_build.py first.")
+        print("No results after fusion.")
         return
 
     if args.no_dedup:
@@ -211,7 +328,8 @@ def main():
             print("---")
         return
 
-    print(f"Query: {args.query}\n")
+    print(f"Query: {args.query}")
+    print(f"Retrieval: {retrieval_mode}\n")
     print(f"Top {len(final)} chunks — re-ranked by similarity + trust tier, "
           f"deduped per source, ordered for LLM attention:\n")
     for i, (score, sim, doc, meta, _dist) in enumerate(final, start=1):

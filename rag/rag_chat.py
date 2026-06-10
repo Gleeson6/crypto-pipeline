@@ -55,6 +55,9 @@ from rag_query import (
     FETCH_MULTIPLIER,
     select_diverse_top_k,
     order_for_attention,
+    load_bm25_index,
+    bm25_retrieve,
+    rrf_merge,
 )
 
 _env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
@@ -255,7 +258,8 @@ def maybe_summarize(session: dict, api_key: str, model: str) -> None:
 # Core retrieval (reused from rag_generate, kept local for flexibility)
 # ---------------------------------------------------------------------------
 
-def retrieve(query, db_path, collection_name, embedder, k, min_trust, source_type):
+def retrieve(query, db_path, collection_name, embedder, k, min_trust, source_type,
+             no_hybrid=False):
     collection = get_collection(db_path, collection_name, embedder=embedder)
     where = {}
     if min_trust:
@@ -264,14 +268,48 @@ def retrieve(query, db_path, collection_name, embedder, k, min_trust, source_typ
         where["source_type"] = source_type
 
     fetch_n = max(k * FETCH_MULTIPLIER, k)
+
+    # Dense retrieval
     results = collection.query(
-        query_texts=[query], n_results=fetch_n, where=where or None
+        query_texts=[query],
+        n_results=fetch_n,
+        where=where or None,
+        include=["documents", "metadatas", "distances"],
     )
-    docs = results.get("documents", [[]])[0]
-    metas = results.get("metadatas", [[]])[0]
-    dists = results.get("distances", [[]])[0]
-    if not docs:
+    dense_docs  = results.get("documents", [[]])[0]
+    dense_metas = results.get("metadatas",  [[]])[0]
+    dense_dists = results.get("distances",  [[]])[0]
+    dense_ids   = results.get("ids",        [[]])[0]
+    if not dense_docs:
         return []
+
+    # Hybrid fusion (BM25 + RRF)
+    docs, metas, dists = dense_docs, dense_metas, dense_dists
+    if not no_hybrid:
+        bm25_data = load_bm25_index(db_path)
+        if bm25_data is not None:
+            dense_ranked  = list(zip(dense_ids, [1 - d for d in dense_dists]))
+            sparse_ranked = bm25_retrieve(query, bm25_data, fetch_n)
+            rrf_scores    = rrf_merge(dense_ranked, sparse_ranked)
+
+            id_to_chunk: dict = {}
+            for cid, doc, meta, dist in zip(dense_ids, dense_docs, dense_metas, dense_dists):
+                id_to_chunk[cid] = (doc, meta, dist)
+            bm25_id_map = {cid: i for i, cid in enumerate(bm25_data["ids"])}
+            for cid, _ in sparse_ranked:
+                if cid not in id_to_chunk:
+                    idx = bm25_id_map.get(cid)
+                    if idx is not None:
+                        id_to_chunk[cid] = (
+                            bm25_data["docs"][idx],
+                            bm25_data["metas"][idx],
+                            1.0,
+                        )
+
+            top_rrf = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)[:fetch_n]
+            docs  = [id_to_chunk[cid][0] for cid, _ in top_rrf if cid in id_to_chunk]
+            metas = [id_to_chunk[cid][1] for cid, _ in top_rrf if cid in id_to_chunk]
+            dists = [id_to_chunk[cid][2] for cid, _ in top_rrf if cid in id_to_chunk]
 
     ranked = select_diverse_top_k(docs, metas, dists, k)
     return order_for_attention(ranked)

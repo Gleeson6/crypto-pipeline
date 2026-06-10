@@ -35,6 +35,9 @@ from rag_query import (
     select_diverse_top_k,
     order_for_attention,
     trim_to_sentences,
+    load_bm25_index,
+    bm25_retrieve,
+    rrf_merge,
 )
 
 # Load XAI_API_KEY from the project-root .env (same convention as executor.py).
@@ -61,32 +64,58 @@ SECTION_LABELS = {
 SECTION_ORDER = ["arxiv_paper", "onchain_reference", "strategy_notes", "blog_or_news"]
 
 SYSTEM_PROMPT = """You are a quant research assistant embedded in a personal Bitcoin \
-trading-system project. You answer using ONLY the grounding context provided \
-below plus sound general quantitative-finance reasoning — never invent figures, \
-papers, or on-chain data that isn't in the context.
+algorithmic trading project. Your job is to give accurate, actionable answers that \
+help the user build and validate a profitable trading system.
 
-Rules for using the context:
-- The context is grouped into labeled sections by source type, each carrying a \
-trust tier (3 = peer-reviewed/curated reference, 2 = the user's own notes, \
-1 = narrative/sentiment — treat tier-1 material as color, not fact).
-- When you state something grounded in the context, cite it inline as \
-(source_type: "Title"). When you reason beyond the context, say so explicitly \
-("based on general principles, not the provided sources...").
-- If sources disagree, surface the disagreement rather than picking one silently — \
-this user is learning and needs to see where the open questions are.
-- If the context doesn't contain enough to answer well, say so plainly instead \
-of filling the gap with confident-sounding guesses.
-- Keep the user's stated context in mind: $100 proof-of-concept capital, \
-1-4 hour swing timeframe, hard 1-2% capital-at-risk-per-trade rule, currently \
-in the validation/paper-trading phase — not live with real money yet."""
+## Answering rule — always give a substantive answer
+
+**You must always give a real answer. Refusing or saying "the context doesn't cover \
+this" is not acceptable on its own.**
+
+Use this priority order:
+
+1. **If the retrieved context directly addresses the question** — answer from it \
+and cite inline as (source_type: "Title"). Prefer tier-3 sources (peer-reviewed / \
+curated reference) over tier-1 (blog/news).
+
+2. **If the retrieved context is sparse or off-topic** — answer from your own \
+quantitative finance knowledge. Clearly flag this with a one-line prefix: \
+*[From general quant knowledge — not in the retrieved sources for this query]*. \
+Then give the full answer. This is the normal fallback — use it freely.
+
+3. **Only after giving the answer**, note any specific empirical data points \
+(e.g. exact current on-chain readings, a specific paper's backtested numbers) \
+that would sharpen the answer further, and where to get them \
+(e.g. "current MVRV reading: Glassnode or CryptoQuant"). \
+This note is an addition to the answer, not a replacement for it.
+
+## Context trust tiers
+- trust=3: peer-reviewed papers or curated on-chain reference docs — treat as fact
+- trust=2: user's own strategy notes — useful but unvalidated
+- trust=1: blog/news/sentiment — color only, not a basis for claims
+
+## Other rules
+- If sources disagree, surface the disagreement — don't silently pick one.
+- Never invent specific figures or paper citations not in the context or your knowledge.
+- Be concrete. "It depends on many factors" without naming them is not useful.
+- User context: $100 proof-of-concept capital, 1-4 hour swing timeframe, \
+  hard 1-2% capital-at-risk-per-trade rule, paper-trading / validation phase. \
+  Calibrate all advice to this scale."""
 
 
 def estimate_tokens(text: str) -> int:
     return max(1, len(text) // CHARS_PER_TOKEN_ESTIMATE)
 
 
-def retrieve(query, db_path, collection_name, embedder, k, min_trust, source_type):
-    """Run the same retrieve → re-rank → dedup → order pipeline as rag_query.py."""
+def retrieve(query, db_path, collection_name, embedder, k, min_trust, source_type,
+             no_hybrid=False):
+    """
+    Retrieve → re-rank → dedup → attention-order pipeline.
+
+    By default runs hybrid search (BM25 + dense, fused with RRF) when a
+    BM25 index exists alongside the ChromaDB store.  Pass no_hybrid=True
+    to force dense-only retrieval (e.g. for ablation / debugging).
+    """
     collection = get_collection(db_path, collection_name, embedder=embedder)
 
     where = {}
@@ -96,13 +125,49 @@ def retrieve(query, db_path, collection_name, embedder, k, min_trust, source_typ
         where["source_type"] = source_type
 
     fetch_n = max(k * FETCH_MULTIPLIER, k)
-    results = collection.query(query_texts=[query], n_results=fetch_n, where=where or None)
 
-    docs = results.get("documents", [[]])[0]
-    metas = results.get("metadatas", [[]])[0]
-    dists = results.get("distances", [[]])[0]
-    if not docs:
+    # ── Dense retrieval ───────────────────────────────────────────────────────
+    results = collection.query(
+        query_texts=[query],
+        n_results=fetch_n,
+        where=where or None,
+        include=["documents", "metadatas", "distances"],
+    )
+    dense_docs  = results.get("documents", [[]])[0]
+    dense_metas = results.get("metadatas",  [[]])[0]
+    dense_dists = results.get("distances",  [[]])[0]
+    dense_ids   = results.get("ids",        [[]])[0]
+    if not dense_docs:
         return []
+
+    # ── Hybrid fusion (BM25 + RRF) ────────────────────────────────────────────
+    docs, metas, dists = dense_docs, dense_metas, dense_dists
+    if not no_hybrid:
+        bm25_data = load_bm25_index(db_path)
+        if bm25_data is not None:
+            dense_ranked  = list(zip(dense_ids, [1 - d for d in dense_dists]))
+            sparse_ranked = bm25_retrieve(query, bm25_data, fetch_n)
+            rrf_scores    = rrf_merge(dense_ranked, sparse_ranked)
+
+            # Unified lookup from dense + BM25-only hits
+            id_to_chunk: dict = {}
+            for cid, doc, meta, dist in zip(dense_ids, dense_docs, dense_metas, dense_dists):
+                id_to_chunk[cid] = (doc, meta, dist)
+            bm25_id_map = {cid: i for i, cid in enumerate(bm25_data["ids"])}
+            for cid, _ in sparse_ranked:
+                if cid not in id_to_chunk:
+                    idx = bm25_id_map.get(cid)
+                    if idx is not None:
+                        id_to_chunk[cid] = (
+                            bm25_data["docs"][idx],
+                            bm25_data["metas"][idx],
+                            1.0,
+                        )
+
+            top_rrf = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)[:fetch_n]
+            docs  = [id_to_chunk[cid][0] for cid, _ in top_rrf if cid in id_to_chunk]
+            metas = [id_to_chunk[cid][1] for cid, _ in top_rrf if cid in id_to_chunk]
+            dists = [id_to_chunk[cid][2] for cid, _ in top_rrf if cid in id_to_chunk]
 
     ranked = select_diverse_top_k(docs, metas, dists, k)
     return order_for_attention(ranked)
@@ -205,13 +270,15 @@ def main():
     parser.add_argument("--collection", default="quant_rag", help="ChromaDB collection name")
     parser.add_argument("--model-embed", default="default", help="Embedding function (matches rag_query.py)")
     parser.add_argument("--model-llm", default=DEFAULT_MODEL, help="Grok model name")
-    parser.add_argument("--k", type=int, default=6, help="Number of context chunks to retrieve")
+    parser.add_argument("--k", type=int, default=8, help="Number of context chunks to retrieve")
     parser.add_argument("--min-trust", type=int, default=0, help="Minimum trust tier (1-3)")
     parser.add_argument("--source-type", default=None, help="Filter to one source_type")
     parser.add_argument("--token-budget", type=int, default=DEFAULT_CONTEXT_TOKEN_BUDGET,
                         help="Approx. max tokens of retrieved context to send")
     parser.add_argument("--show-context", action="store_true",
                         help="Print the assembled context block before the answer (for debugging)")
+    parser.add_argument("--no-hybrid", action="store_true",
+                        help="Disable BM25 hybrid search — use dense-only retrieval")
     args = parser.parse_args()
 
     api_key = os.getenv("XAI_API_KEY")
@@ -222,7 +289,8 @@ def main():
 
     embedder = get_embedder(args.model_embed)
     rows = retrieve(args.query, args.db_path, args.collection, embedder,
-                    args.k, args.min_trust, args.source_type)
+                    args.k, args.min_trust, args.source_type,
+                    no_hybrid=args.no_hybrid)
 
     if not rows:
         print("No context retrieved — has the index been built? Run rag_build.py first.")
