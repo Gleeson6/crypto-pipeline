@@ -89,6 +89,91 @@ def session_flags(hour: pd.Series):
     return is_asian, is_european, is_us, is_overlap_eu_us
 
 
+# ── Data integrity: OHLC sanity + gap-free hourly grid ────────────────────────
+
+MS_1H = 3_600_000   # one hour in Unix milliseconds
+
+
+def enforce_ohlc_sanity(klines: pd.DataFrame):
+    """
+    Quarantine bad ticks BEFORE any feature is computed.
+
+    A single corrupt candle (a feed glitch printing high=0, close=1e9, or a
+    negative volume) silently poisons returns, RSI, ATR, Bollinger and every
+    rolling window built on top of it — and winsorization downstream cannot
+    undo a contaminated window. So we NULL the OHLCV of any row that violates
+    basic candle invariants. The row is then treated exactly like a missing
+    candle by the reindex step (i.e. it becomes a gap, not a learned outlier).
+
+    Invariants enforced:
+      high >= max(open, close, low)
+      low  <= min(open, close, high)
+      all prices > 0
+      volume >= 0
+    """
+    k = klines.copy()
+    o, h, l, c, v = k["open"], k["high"], k["low"], k["close"], k["volume"]
+    bad_high = (h < o) | (h < c) | (h < l)
+    bad_low  = (l > o) | (l > c) | (l > h)
+    nonpos   = (o <= 0) | (h <= 0) | (l <= 0) | (c <= 0)
+    neg_vol  = v < 0
+    bad = bad_high | bad_low | nonpos | neg_vol
+    report = {
+        "bad_high":          int(bad_high.sum()),
+        "bad_low":           int(bad_low.sum()),
+        "nonpositive_price": int(nonpos.sum()),
+        "negative_volume":   int(neg_vol.sum()),
+        "rows_quarantined":  int(bad.sum()),
+    }
+    if bad.any():
+        k.loc[bad, ["open", "high", "low", "close", "volume"]] = np.nan
+    return k, report
+
+
+def reindex_to_hourly_grid(klines: pd.DataFrame):
+    """
+    Reindex onto a complete, evenly-spaced 1H UTC grid (no missing candles).
+
+    WHY THIS IS THE CORE FIX
+    ────────────────────────
+    Every rolling/shift feature and the forward target is POSITIONAL
+    (shift(4) means "4 rows back", not "4 hours back"). If an hour is missing,
+    row position stops equalling clock time: shift(4) silently spans 5 real
+    hours and the "4H forward return" target gets measured over the wrong
+    horizon. After reindexing, ROW POSITION == CLOCK HOUR, so:
+
+      • every shift()/rolling() window is time-correct, and
+      • any return/target whose endpoint lands on a genuinely missing hour
+        becomes NaN (correctly undefined) instead of being fabricated.
+
+    Inserted (synthetic) rows are flagged `_is_real_candle = False` and dropped
+    from the final feature table at the end of build_features — they exist only
+    so neighbouring real rows receive time-correct windows.
+    """
+    k = klines.sort_values("open_time").reset_index(drop=True)
+    start, end = int(k["open_time"].min()), int(k["open_time"].max())
+    if (end - start) % MS_1H != 0:
+        # Binance 1H open_time is always :00 aligned; warn but proceed.
+        print(f"  ⚠️  grid span is not an exact multiple of 1H "
+              f"(start={start}, end={end}) — check source alignment")
+    full = pd.DataFrame(
+        {"open_time": np.arange(start, end + MS_1H, MS_1H, dtype=np.int64)}
+    )
+    n_expected = len(full)
+    merged = full.merge(k, on="open_time", how="left")
+    merged["_is_real_candle"] = merged["open"].notna()
+    n_present = int(merged["_is_real_candle"].sum())
+    report = {
+        "grid_start_ms":  start,
+        "grid_end_ms":    end,
+        "hours_expected": n_expected,
+        "hours_present":  n_present,
+        "hours_missing":  n_expected - n_present,
+        "pct_complete":   round(100 * n_present / n_expected, 4),
+    }
+    return merged, report
+
+
 # ── Main feature engineering ──────────────────────────────────────────────────
 
 def build_features(db_path: str = DB_PATH) -> pd.DataFrame:
@@ -110,6 +195,23 @@ def build_features(db_path: str = DB_PATH) -> pd.DataFrame:
         sys.exit(1)
 
     print(f"  klines:         {len(klines):,} rows")
+
+    # ── Data integrity (BEFORE any feature is computed) ───────────────────────
+    # 1) Quarantine bad ticks so they cannot poison returns/rolling windows.
+    klines, ohlc_report = enforce_ohlc_sanity(klines)
+    if ohlc_report["rows_quarantined"]:
+        print(f"  OHLC sanity:    {ohlc_report['rows_quarantined']} bad rows quarantined "
+              f"(bad_high={ohlc_report['bad_high']}, bad_low={ohlc_report['bad_low']}, "
+              f"nonpos={ohlc_report['nonpositive_price']}, neg_vol={ohlc_report['negative_volume']})")
+    else:
+        print(f"  OHLC sanity:    OK (0 bad ticks)")
+
+    # 2) Reindex onto a complete 1H grid so shift()/rolling()/target are
+    #    time-correct (row position == clock hour). See reindex_to_hourly_grid.
+    klines, grid_report = reindex_to_hourly_grid(klines)
+    print(f"  Hourly grid:    {grid_report['hours_present']:,}/{grid_report['hours_expected']:,} "
+          f"hours present ({grid_report['pct_complete']}% complete, "
+          f"{grid_report['hours_missing']} missing/quarantined → inserted as NaN)")
 
     # ── Load footprint ────────────────────────────────────────────────────────
     fp = con.execute("""
@@ -184,9 +286,11 @@ def build_features(db_path: str = DB_PATH) -> pd.DataFrame:
     df["log_return_1h"]  = np.log(df["close"] / df["close"].shift(1))
     df["log_return_4h"]  = np.log(df["close"] / df["close"].shift(4))
     df["log_return_24h"] = np.log(df["close"] / df["close"].shift(24))
-    df["return_1h"]      = df["close"].pct_change(1)
-    df["return_4h"]      = df["close"].pct_change(4)
-    df["return_24h"]     = df["close"].pct_change(24)
+    # Explicit division (NOT pct_change): pct_change defaults to fill_method='pad',
+    # which forward-fills NaN gap rows and would fabricate cross-gap returns.
+    df["return_1h"]      = df["close"] / df["close"].shift(1)  - 1
+    df["return_4h"]      = df["close"] / df["close"].shift(4)  - 1
+    df["return_24h"]     = df["close"] / df["close"].shift(24) - 1
 
     # Candle shape
     df["candle_body"]    = (df["close"] - df["open"]).abs() / df["open"]
@@ -325,13 +429,25 @@ def build_features(db_path: str = DB_PATH) -> pd.DataFrame:
         df["liq_direction"] = np.sign(df["liq_net_vol"])
 
     # ── 10. Target variable ───────────────────────────────────────────────────
-    # What we're predicting: 4H forward return
-    df["target_return_4h"]  = df["close"].pct_change(4).shift(-4)
-    df["target_direction_4h"] = np.sign(df["target_return_4h"])  # +1 / -1 / 0
+    # What we're predicting: 4H FORWARD return = close[t+4] / close[t] - 1.
+    # Explicit forward division (equiv. to pct_change(4).shift(-4) but without
+    # fill_method='pad'): on the gap-free grid this is the true 4-clock-hour
+    # return, and it is NaN whenever close[t] or close[t+4] is a missing hour —
+    # i.e. we NEVER train on or predict a return measured across a data gap.
+    df["target_return_4h"]    = df["close"].shift(-4) / df["close"] - 1
+    df["target_direction_4h"] = np.sign(df["target_return_4h"])  # +1 / -1 / 0 / NaN
 
-    # ── Drop rows with insufficient history ───────────────────────────────────
-    # Need at least 200 candles for EMA-200
+    # ── Drop warmup rows (need ≥200 candles for EMA-200) ──────────────────────
     df = df.iloc[200:].reset_index(drop=True)
+
+    # ── Drop synthetic rows inserted only to make the grid gap-free ───────────
+    # Real rows keep their now-time-correct windows; return/target values that
+    # spanned a gap remain NaN (handled by cleaning / dropped before training).
+    n_synth = int((~df["_is_real_candle"]).sum())
+    df = df[df["_is_real_candle"]].drop(columns=["_is_real_candle"]).reset_index(drop=True)
+    if n_synth:
+        print(f"  Dropped {n_synth:,} synthetic gap rows "
+              f"(missing or quarantined candles — never used for training)")
 
     print(f"  Features computed: {df.shape[1]} columns, {len(df):,} rows")
     return df
