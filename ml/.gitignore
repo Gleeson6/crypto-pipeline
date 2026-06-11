@@ -1,0 +1,12 @@
+# DuckDB feature store — regenerable, do not commit
+feature_store.duckdb
+feature_store.duckdb.wal
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Temp download files
+*.zip
+*.csv.tmp
