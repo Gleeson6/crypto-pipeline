@@ -39,6 +39,7 @@ import csv
 import io
 import os
 import sys
+import tempfile
 import time
 import zipfile
 from collections import defaultdict
@@ -145,10 +146,44 @@ def compute_max_imbalance(buy_profile: dict, sell_profile: dict) -> float:
     return max_imb
 
 
+def bucket_to_row(open_time: int, b: dict, cvd: float) -> tuple:
+    """Compute features for one completed hour bucket and return as a tuple."""
+    poc, vah, val = compute_poc_vah_val(b["vol_profile"])
+    max_imb       = compute_max_imbalance(b["buy_profile"], b["sell_profile"])
+    delta         = b["buy_vol"] - b["sell_vol"]
+    total_vol     = b["buy_vol"] + b["sell_vol"]
+    return (open_time, delta, b["buy_vol"], b["sell_vol"], total_vol,
+            poc, vah, val, b["large_cnt"], b["large_vol"],
+            b["buy_cnt"], b["sell_cnt"], max_imb, cvd)
+
+
+def flush_batch(con, batch: list) -> None:
+    """Batch insert completed hour rows — much faster than one-by-one."""
+    if batch:
+        con.executemany(
+            "INSERT OR IGNORE INTO footprint VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            batch
+        )
+
+
+def empty_bucket() -> dict:
+    return {
+        "buy_vol":      0.0,
+        "sell_vol":     0.0,
+        "buy_cnt":      0,
+        "sell_cnt":     0,
+        "large_cnt":    0,
+        "large_vol":    0.0,
+        "vol_profile":  defaultdict(float),
+        "buy_profile":  defaultdict(float),
+        "sell_profile": defaultdict(float),
+    }
+
+
 def process_month(con, year: int, month: int, retries: int = 3) -> int:
     """
-    Stream the monthly aggTrades zip, aggregate to 1H buckets, compute
-    footprint features, insert into DuckDB. Returns rows inserted.
+    Stream monthly aggTrades zip, flush each completed 1H bucket to DB
+    immediately — never holds more than ~1 hour of data in RAM.
     """
     fname = f"BTCUSDT-aggTrades-{year:04d}-{month:02d}.zip"
     url   = f"{VISION_BASE}/{fname}"
@@ -162,108 +197,111 @@ def process_month(con, year: int, month: int, retries: int = 3) -> int:
                 return 0
             resp.raise_for_status()
 
-            # ── Aggregate ticks → per-hour buckets ────────────────────────────
-            # Structure: {open_time_ms: {"buy_vol", "sell_vol", "buy_cnt",
-            #             "sell_cnt", "large_cnt", "large_vol",
-            #             "vol_profile", "buy_profile", "sell_profile"}}
-            buckets: dict = {}
+            # Stream to temp file on disk
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+            try:
+                downloaded = 0
+                for chunk in resp.iter_content(chunk_size=8 * 1024 * 1024):
+                    tmp.write(chunk)
+                    downloaded += len(chunk)
+                tmp.flush()
+                tmp.close()
+                print(f"({downloaded / 1024**2:.0f} MB) processing...", flush=True)
 
-            raw_bytes = io.BytesIO(resp.content)
-            with zipfile.ZipFile(raw_bytes) as zf:
-                with zf.open(zf.namelist()[0]) as f:
-                    reader = csv.reader(io.TextIOWrapper(f, encoding="utf-8"))
-                    for row in reader:
-                        # cols: agg_id, price, qty, first_id, last_id, time, is_buyer_maker
-                        if len(row) < 7:
-                            continue
-                        try:
-                            price          = float(row[1])
-                            qty            = float(row[2])
-                            ts_ms          = int(row[5])
-                            is_buyer_maker = row[6].strip().lower() in ("true", "1")
-                        except (ValueError, IndexError):
-                            continue
+                # ── Stream CSV, batch-insert every 100 completed hours ────────
+                cur_open_time = None
+                cur_bucket    = None
+                running_cvd   = 0.0
+                last_day      = None
+                inserted      = 0
+                pending_rows  = []   # batch buffer
 
-                        open_time = floor_to_hour_ms(ts_ms)
-                        if open_time not in buckets:
-                            buckets[open_time] = {
-                                "buy_vol":      0.0,
-                                "sell_vol":     0.0,
-                                "buy_cnt":      0,
-                                "sell_cnt":     0,
-                                "large_cnt":    0,
-                                "large_vol":    0.0,
-                                "vol_profile":  defaultdict(float),
-                                "buy_profile":  defaultdict(float),
-                                "sell_profile": defaultdict(float),
-                            }
+                BATCH_SIZE    = 100  # insert every 100 hours → ~10× faster
 
-                        b = buckets[open_time]
-                        lvl = round_price(price)
+                with zipfile.ZipFile(tmp.name) as zf:
+                    with zf.open(zf.namelist()[0]) as f:
+                        reader = csv.reader(io.TextIOWrapper(f, encoding="utf-8"))
+                        for row in reader:
+                            if len(row) < 7:
+                                continue
+                            try:
+                                price          = float(row[1])
+                                qty            = float(row[2])
+                                ts_ms          = int(row[5])
+                                is_buyer_maker = row[6].strip().lower() in ("true", "1")
+                            except (ValueError, IndexError):
+                                continue
 
-                        b["vol_profile"][lvl] += qty
-                        if is_buyer_maker:
-                            # seller aggressed
-                            b["sell_vol"]          += qty
-                            b["sell_cnt"]          += 1
-                            b["sell_profile"][lvl] += qty
-                        else:
-                            # buyer aggressed
-                            b["buy_vol"]           += qty
-                            b["buy_cnt"]           += 1
-                            b["buy_profile"][lvl]  += qty
+                            # Binance Vision files from 2025 onward use microseconds.
+                            # Valid ms timestamps (2020-2030) are 13 digits (~1.5e12–1.9e12).
+                            # Valid μs timestamps are 16 digits (~1.5e15–1.9e15).
+                            # Threshold of 1e15 safely separates the two.
+                            if ts_ms >= 1_000_000_000_000_000:
+                                ts_ms //= 1000  # μs → ms
 
-                        if qty >= LARGE_TRADE_BTC:
-                            b["large_cnt"] += 1
-                            b["large_vol"] += qty
+                            open_time = floor_to_hour_ms(ts_ms)
 
-            # ── Compute CVD (cumulative delta, reset daily) ───────────────────
-            sorted_times = sorted(buckets.keys())
-            running_cvd  = 0.0
-            last_day     = None
-            cvd_map      = {}
-            for ot in sorted_times:
-                day = floor_to_day_ms(ot)
-                if day != last_day:
-                    running_cvd = 0.0
-                    last_day = day
-                b = buckets[ot]
-                running_cvd += b["buy_vol"] - b["sell_vol"]
-                cvd_map[ot] = running_cvd
+                            # New hour → compute features and add to batch
+                            if open_time != cur_open_time:
+                                if cur_bucket is not None:
+                                    day = floor_to_day_ms(cur_open_time)
+                                    if day != last_day:
+                                        running_cvd = 0.0
+                                        last_day = day
+                                    running_cvd += cur_bucket["buy_vol"] - cur_bucket["sell_vol"]
+                                    pending_rows.append(
+                                        bucket_to_row(cur_open_time, cur_bucket, running_cvd)
+                                    )
+                                    inserted += 1
 
-            # ── Build insert batch ────────────────────────────────────────────
-            batch = []
-            for open_time in sorted_times:
-                b = buckets[open_time]
-                poc, vah, val = compute_poc_vah_val(b["vol_profile"])
-                max_imb       = compute_max_imbalance(b["buy_profile"], b["sell_profile"])
-                delta         = b["buy_vol"] - b["sell_vol"]
-                total_vol     = b["buy_vol"] + b["sell_vol"]
-                batch.append((
-                    open_time,
-                    delta,
-                    b["buy_vol"],
-                    b["sell_vol"],
-                    total_vol,
-                    poc,
-                    vah,
-                    val,
-                    b["large_cnt"],
-                    b["large_vol"],
-                    b["buy_cnt"],
-                    b["sell_cnt"],
-                    max_imb,
-                    cvd_map[open_time],
-                ))
+                                    # Progress print every 50 hours
+                                    if inserted % 50 == 0:
+                                        dt = datetime.fromtimestamp(cur_open_time / 1000, tz=timezone.utc)
+                                        print(f"    ... {inserted} hrs done  ({dt.strftime('%Y-%m-%d %H:%M')})", flush=True)
 
-            if batch:
-                con.executemany("""
-                    INSERT OR IGNORE INTO footprint VALUES
-                    (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """, batch)
+                                    # Batch write every 100 hours
+                                    if len(pending_rows) >= BATCH_SIZE:
+                                        flush_batch(con, pending_rows)
+                                        pending_rows = []
 
-            print(f"{len(batch)} hourly footprints computed and inserted.")
-            return len(batch)
+                                cur_open_time = open_time
+                                cur_bucket    = empty_bucket()
+
+                            b   = cur_bucket
+                            lvl = round_price(price)
+                            b["vol_profile"][lvl] += qty
+                            if is_buyer_maker:
+                                b["sell_vol"]          += qty
+                                b["sell_cnt"]          += 1
+                                b["sell_profile"][lvl] += qty
+                            else:
+                                b["buy_vol"]           += qty
+                                b["buy_cnt"]           += 1
+                                b["buy_profile"][lvl]  += qty
+                            if qty >= LARGE_TRADE_BTC:
+                                b["large_cnt"] += 1
+                                b["large_vol"] += qty
+
+                # Flush final bucket + any remaining batch
+                if cur_bucket is not None and cur_open_time is not None:
+                    day = floor_to_day_ms(cur_open_time)
+                    if day != last_day:
+                        running_cvd = 0.0
+                    running_cvd += cur_bucket["buy_vol"] - cur_bucket["sell_vol"]
+                    pending_rows.append(
+                        bucket_to_row(cur_open_time, cur_bucket, running_cvd)
+                    )
+                    inserted += 1
+                flush_batch(con, pending_rows)
+
+            finally:
+                try:
+                    os.unlink(tmp.name)
+                except OSError:
+                    pass
+
+            print(f"  ✓ {inserted} hourly footprints inserted.")
+            return inserted
 
         except Exception as e:
             print(f"error (attempt {attempt}/{retries}): {e}")
