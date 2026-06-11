@@ -1,39 +1,96 @@
-# Crypto Trading Pipeline
+# Crypto Quant Pipeline
 
-## Project Overview
-A production-grade algorithmic trading system built on real-time data engineering infrastructure. The dual goal is to **learn core data engineering deeply** (Kafka, DuckDB, TimescaleDB, Docker) while **building a system that eventually generates profit** from automated crypto trading.
-
-**Owner:** Gleezon (gleesonminoy7@gmail.com)  
-**Environment:** WSL (Ubuntu) on Windows — project lives at `~/crypto-pipeline/`  
-**GitHub:** https://github.com/Gleeson6/crypto-pipeline  
-**Timeline to live trading:** 3–6 months  
-**Current phase:** Phase 4 complete — running end-to-end on Binance Testnet
+**Owner:** Gleezon (gleesonminoy7@gmail.com)
+**Environment:** WSL (Ubuntu) on Windows
+**Goal:** Production-grade Bitcoin prediction system — data engineering foundation → ML models → live trading
 
 ---
 
 ## Architecture
 
 ```
-Binance WebSocket (live prices)
-        ↓
-    Kafka (message queue)
-    Topic: crypto_ticks
-        ↓
-  Python Consumer (dual-write)
-        ↓
-   ┌────┴────────────┐
-DuckDB           TimescaleDB
-(analysis/RSI)   (live storage)
-        ↓
-  RSI Strategy Engine
-  (signals: BUY / SELL / HOLD)
-        ↓
-  Binance Testnet Executor
-  (places real paper trades)
-        ↓
-  Grafana Dashboard (Phase 5)
-        ↓
-  Airflow Orchestration (Phase 7)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  LAYER 1 — DATA INGESTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Binance WebSocket          Binance REST API           Binance Vision (zips)
+  Live ticks: BTC/ETH        klines 2Y history          Monthly aggTrades
+  SOL/BNB → Kafka            funding rates, OI          → footprint (delta,
+  Topic: crypto_ticks        fetch_klines.py             CVD, POC, VAH/VAL)
+                             fetch_funding_oi.py        fetch_footprint.py
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  LAYER 2 — STORAGE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  TimescaleDB                DuckDB                     ChromaDB
+  (live tick storage)        (feature_store.duckdb)     (rag/rag_db/)
+  real-time pipeline         klines · footprint         36,557 embedded
+  hypertable, indexes        funding · ml_features      quant knowledge chunks
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  LAYER 3 — FEATURE ENGINEERING  (ml/compute_features.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  82 features across 9 groups — 17,320 rows (Jun 2024 → May 2026)
+
+  Session/Time    │ hour_sin/cos, is_asian/european/us_session
+  Price/Returns   │ log_return_1h/4h/24h, candle_body, wicks
+  Volatility      │ volatility_24h/7d, vol_ratio, ATR
+  Technicals      │ RSI-7/14, MACD, Bollinger Bands, EMA-8/21/50/200
+  Volume          │ vol_zscore, taker_buy_ratio, vol_ratio_24h
+  Footprint       │ delta_norm, CVD, poc_distance, va_range, large_trade_ratio
+  Funding         │ funding_rate, extreme_long/short flags, 8h_change
+  Liq Proxy       │ liq_long/short_proxy, cascade_flag, cascade_4h/24h
+  Target          │ target_return_4h, target_direction_4h
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  LAYER 4 — ML MODELS  (ml/train_model.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  XGBoost Classifier                 XGBoost Regressor
+  Predicts direction (UP / DOWN)     Predicts 4H return magnitude
+  Walk-forward split 70/10/20        Heavy regularization
+  No test set leakage                No early stopping
+  Accuracy: 51.3% (+3.4% vs naive)
+
+  Top signals: log_return_24h · hour_cos · large_trade_vol
+               delta_norm · ema_50 · rsi_7 · taker_buy_ratio
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  LAYER 5 — QUANT RAG ENGINE  (rag/)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Knowledge Base              Retrieval                  Generation
+  506 arXiv papers            ChromaDB dense search      Grok grok-4-fast
+  Quant books (Hull,          BM25 sparse search         Streaming SSE
+  Wilmott, Taleb)             RRF hybrid fusion          rag_generate.py
+  On-chain reference docs     Trust-weighted reranking   rag_chat.py
+  36,557 chunks embedded      rag_query.py               Multi-turn memory
+
+  FastAPI server: localhost:8000  (managed by systemd quant-rag.service)
+  Web UI: http://localhost:8000   (always live while WSL is running)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  LAYER 6 — STRATEGY ENGINE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  RSI signals + XGBoost prediction → BUY / SELL / HOLD
+  Timeframe: 1–4H swing trading
+  Hard risk rules (code-enforced, not config):
+    Max 1–2% capital per trade · Stop-loss 2% · Take-profit 3%
+    Max 5 trades per day
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  LAYER 7 — ORCHESTRATION & MONITORING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Binance Testnet             Grafana :3000              Airflow :8080
+  Paper trading               Pipeline monitor           DAG orchestration
+  (→ $100 live after          crypto_pipeline DAG        LocalExecutor
+   3mo paper validation)
+
+  systemd quant-rag.service — auto-restarts on crash, survives WSL reboot
 ```
 
 ---
@@ -41,123 +98,129 @@ DuckDB           TimescaleDB
 ## Tech Stack
 
 | Layer | Tool | Purpose |
-|-------|------|---------|
-| Ingestion | Binance WebSocket | Live BTC/USDT price stream |
+|---|---|---|
+| Ingestion | Binance WebSocket | Live ticks: BTC/ETH/SOL/BNB |
 | Queue | Apache Kafka | Decouples ingestion from processing |
-| Coordinator | Zookeeper | Manages Kafka internals |
-| Analytical DB | DuckDB | Fast local queries, RSI calculation |
-| Time-series DB | TimescaleDB (PostgreSQL) | Permanent tick storage |
-| Strategy | Python (RSI engine) | Generates BUY/SELL/HOLD signals |
-| Execution | python-binance (Testnet) | Places paper trades automatically |
-| Infrastructure | Docker Compose | Runs Kafka + Zookeeper + TimescaleDB |
-| Environment | Python venv | Isolated package management |
-
----
-
-## Trading Configuration
-
-**Current coins:** BTC/USDT  
-**Planned coins:** ETH/USDT, SOL/USDT, BNB/USDT  
-**Current strategy:** RSI (14-period, 1-minute candles)  
-**Planned strategies:** ML-based price direction prediction  
-**Trade size:** 0.001 BTC per trade  
-**Exchange:** Binance (Testnet now → Live in 3–6 months)
-
-**RSI thresholds:**
-- RSI < 30 → BUY (oversold)
-- RSI > 70 → SELL (overbought)
-- 30–70 → HOLD
-
----
-
-## Project Structure
-
-```
-crypto-pipeline/
-├── ingestion/
-│   └── binance_stream.py      # Connects to Binance WebSocket, publishes to Kafka
-├── storage/
-│   ├── consumer.py            # Kafka consumer, dual-writes to DuckDB + TimescaleDB
-│   ├── timescale_setup.py     # One-time DB schema setup (hypertable, indexes)
-│   ├── view_trades.py         # CLI trade history viewer
-│   └── crypto.db              # DuckDB database file (gitignored)
-├── strategy/
-│   ├── rsi_engine.py          # RSI calculation + signal generation
-│   ├── executor.py            # Binance Testnet order placement + trade logging
-│   └── trade_engine.py        # Main loop: RSI signals → execute trades
-├── docker-compose.yml         # Kafka + Zookeeper + TimescaleDB containers
-├── .env                       # API keys (gitignored — NEVER commit this)
-├── .env.example               # Template for API keys
-└── .gitignore
-```
+| Live DB | TimescaleDB | Real-time tick storage, hypertable |
+| Analytical DB | DuckDB | Feature store, ML training data |
+| Vector DB | ChromaDB | Quant knowledge embeddings |
+| Embeddings | MiniLM (ONNX) | ChromaDB default, no PyTorch needed |
+| LLM | Grok grok-4-fast (xAI) | RAG generation, streaming |
+| ML | XGBoost | Classifier + regressor, walk-forward CV |
+| RAG Server | FastAPI + uvicorn | Persistent server, warm in memory |
+| Orchestration | Apache Airflow | Pipeline DAGs, retry logic |
+| Monitoring | Grafana | Real-time dashboard |
+| Infrastructure | Docker Compose | Kafka + TimescaleDB + Airflow |
 
 ---
 
 ## Phase Progress
 
 | Phase | Description | Status |
-|-------|-------------|--------|
-| 1 | Binance WebSocket → live BTC ticks | ✅ Complete |
-| 2 | Kafka message queue | ✅ Complete |
-| 3 | DuckDB + TimescaleDB storage | ✅ Complete |
-| 4 | RSI strategy + Binance Testnet execution | ✅ Complete |
-| 5 | Grafana monitoring dashboard | 🔄 Next |
-| 6 | Risk management (stop-loss, position sizing) | ⬜ Pending |
-| 7 | Airflow orchestration | ⬜ Pending |
-| 8 | Multi-coin support (ETH, SOL, BNB) | ⬜ Pending |
-| 9 | ML-based prediction strategy | ⬜ Pending |
-| 10 | Live trading with real money | ⬜ 3–6 months |
+|---|---|---|
+| 1 | Binance WebSocket → Kafka ingestion | ✅ |
+| 2 | Kafka message queue | ✅ |
+| 3 | DuckDB + TimescaleDB dual-write storage | ✅ |
+| 4 | RSI strategy engine + Binance Testnet executor | ✅ |
+| 5 | Grafana monitoring dashboard | ✅ |
+| 6 | Risk management (stop-loss 2%, take-profit 3%, max 5 daily trades) | ✅ |
+| 7 | Airflow orchestration (crypto_pipeline DAG) | ✅ |
+| 8 | Multi-coin support (BTC/ETH/SOL/BNB parallel threads) | ✅ |
+| 9a | ChromaDB vector DB + embedding pipeline | ✅ |
+| 9b | Document ingestion (506 arXiv papers + quant books + web) | ✅ |
+| 9c | RAG query engine (Grok API, streaming UI, conversation memory) | ✅ |
+| 9d | Hybrid search (BM25 + dense, RRF fusion) + FastAPI server | ✅ |
+| 9e | systemd service — RAG server auto-starts on WSL boot | ✅ |
+| 9f | ML feature engineering — 82 features, 17,320 rows, 2Y history | ✅ |
+| 9g | Footprint ingestion — full 24-month aggTrades (microsecond fix) | ✅ |
+| 9h | XGBoost classifier + regressor — walk-forward 70/10/20 split | ✅ |
+| 9i | Backtesting (VectorBT) | 🔄 Next |
+| 9j | Connect ML signals → trade engine | ⬜ |
+| 9k | Paper trading — 3 months Binance Testnet | ⬜ |
+| 9l | LSTM ensemble (sequence patterns) | ⬜ |
+| 10 | $100 live trading → scale | ⬜ |
 
 ---
 
-## How to Run (Every Session)
+## Project Structure
 
-**Step 1 — Start Docker infrastructure:**
+```
+crypto data pipeline/
+├── ingestion/
+│   └── binance_stream.py          # WebSocket → Kafka
+├── storage/
+│   ├── consumer.py                # Kafka → DuckDB + TimescaleDB
+│   └── timescale_setup.py
+├── strategy/
+│   └── trade_engine.py            # RSI signals → Binance Testnet
+├── ml/
+│   ├── setup_db.py                # DuckDB schema
+│   ├── fetch_klines.py            # 2Y OHLCV history
+│   ├── fetch_funding_oi.py        # Funding rates + open interest
+│   ├── fetch_footprint.py         # aggTrades → delta/CVD/POC (μs fix)
+│   ├── ingest_all.py              # One-shot full ingestion
+│   ├── compute_features.py        # 82 features → ml_features table
+│   ├── correlations.py            # Spearman ranking vs 4H target
+│   ├── train_model.py             # XGBoost classifier + regressor
+│   ├── feature_store.duckdb       # All ML data (gitignored)
+│   ├── models/                    # Trained model .pkl files (gitignored)
+│   └── data/                      # Correlation CSVs
+├── rag/
+│   ├── rag_build.py               # Embed + index documents into ChromaDB
+│   ├── rag_query.py               # Hybrid search (BM25 + dense, RRF)
+│   ├── rag_generate.py            # Grok streaming generation
+│   ├── rag_chat.py                # Multi-turn conversation memory
+│   ├── rag_server.py              # FastAPI persistent server :8000
+│   ├── build_bm25_only.py         # Rebuild BM25 index from ChromaDB
+│   └── rag_db/                    # ChromaDB + BM25 index (gitignored)
+├── scripts/
+│   ├── arxiv_ingest.py            # arXiv paper scraper (506 papers)
+│   └── onchain_docs/              # Reference on-chain docs
+├── docker-compose.yml
+├── .env                           # API keys (NEVER commit)
+└── .env.example
+```
+
+---
+
+## Key Services
+
+| Service | URL | Start |
+|---|---|---|
+| RAG Web UI | http://localhost:8000 | Auto (systemd) |
+| Grafana | http://localhost:3000 | `docker compose up -d` |
+| Airflow | http://localhost:8080 | `docker compose up -d` |
+
 ```bash
-cd ~/crypto-pipeline
-sudo service docker start
+# RAG server
+sudo systemctl status quant-rag
+sudo systemctl restart quant-rag
+sudo journalctl -u quant-rag -f     # live logs
+
+# Infrastructure
 docker compose up -d
 ```
 
-**Step 2 — Activate virtual environment:**
-```bash
-source venv/bin/activate
-```
+---
 
-**Step 3 — Open 3 terminal tabs and run:**
-```bash
-# Tab 1 — Live data ingestion from Binance
-python3 ingestion/binance_stream.py
+## Signal Confidence
 
-# Tab 2 — Store ticks to DuckDB + TimescaleDB
-python3 storage/consumer.py
+| Data Layer | Reasoning Confidence |
+|---|---|
+| Current (technicals + footprint + funding) | ~60% |
+| + Full OI history | ~73% |
+| + Real liquidations | ~82% |
+| + Exchange inflows/outflows | ~88% |
+| + Whale wallet movements | ~92% |
 
-# Tab 3 — RSI strategy + auto trading on Testnet
-python3 strategy/trade_engine.py
-```
-
-**View trade history anytime:**
-```bash
-python3 storage/view_trades.py
-```
+Current model accuracy: **51.3% directional** (baseline: 51.2%).
+Target with full data stack: **58–65%** — sufficient for profitability with 2:1 reward/risk.
 
 ---
 
 ## Important Notes
 
-- **Never commit `.env`** — it contains real API keys
-- **Testnet only** — all trades use fake money until Phase 10
-- **venv must be active** — always run `source venv/bin/activate` before any Python script
-- **WSL path:** `~/crypto-pipeline/` — always `cd` here before running commands
-- **Windows path:** `C:\Users\User\Documents\Claude\Projects\crypto data pipeline\`
-- **Git reminder:** Push code to GitHub after every new feature or phase
-
----
-
-## Key Decisions Made
-
-- **Kafka over Redis Streams** — chosen for industry-standard message queue patterns
-- **DuckDB for analysis** — zero setup, blazing fast for RSI/backtesting queries
-- **TimescaleDB for production** — handles millions of tick rows with time-series superpowers
-- **RSI first, ML later** — understand rule-based logic before adding ML complexity
-- **Testnet before live** — validate all strategies with paper money first
+- **Never commit `.env`** — contains XAI_API_KEY and Binance API keys
+- **`quant_venv`** for ML/RAG scripts — `source ~/quant_venv/bin/activate`
+- **Testnet only** — no real money until 3-month paper trading validates edge
+- **Hard risk rule** — 1–2% max capital per trade, enforced in code not config
